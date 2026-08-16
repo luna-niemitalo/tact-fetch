@@ -1,3 +1,8 @@
 .direnv/
 build/
 development
+
+# Materialized from the `casclib` flake input + vendor/patches/ by the
+# devShell's shellHook -- not tracked, not a submodule. See
+# vendor/patches/README.md.
+/vendor/CascLib/

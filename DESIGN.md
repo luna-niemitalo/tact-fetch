@@ -59,18 +59,22 @@ already tells you that, not a flag buried in `--help`.
 Practical consequence: **this project should not import or link against
 `casc-tool`'s code.** It needs the same *kind* of local-CASC-read
 capability casc-tool has (resolving a FileDataID to its EKey/CKey/size via
-the local ENCODING/ROOT manifest), so it vendors its own copy of CascLib,
-the same way casc-tool does (`vendor/CascLib` git submodule, spliced in at
-build time — see casc-tool's own README "Why this needed more than 'just
-cmake'" section for the exact mechanism if useful as a reference). The only
+the local ENCODING/ROOT manifest), so it vendors its own copy of CascLib
+under `vendor/CascLib` — originally a git submodule mirroring casc-tool's
+own convention, later replaced (§9, 2026-08-16) by fetching it through
+the Nix flake's `casclib` input instead, once a local patch needed
+keeping in sync made two separately-tracked copies (submodule commit +
+flake.lock rev) worth collapsing into one. See casc-tool's own README
+"Why this needed more than 'just cmake'" section for the underlying
+splicing mechanism if useful as a reference. The only
 sanctioned coupling between the two projects is a **plain text file
 format**: one FileDataID per line, identical to casc-tool's own
-`extract-batch --from-list` convention — this tool can optionally accept
-such a file as a filter/seed (e.g. "only fetch these specific IDs," useful
-for a targeted retry or a scoped test run), but must also be able to
-compute its own worklist from scratch by scanning the storage directly.
-Nothing about that coupling requires casc-tool's source, only its file
-format.
+`extract-batch --from-list` convention — this tool *requires* such a file
+as its worklist seed (e.g. "fetch exactly these IDs," the output of a
+targeted retry or a scoped test run someone already decided on). It never
+computes its own worklist by independently scanning the storage — this is
+a companion tool that fetches a named list, not a scraper. Nothing about
+that coupling requires casc-tool's source, only its file format.
 
 ## 4. What was learned about the actual download mechanics (grounded, not guessed)
 
@@ -145,11 +149,12 @@ stay conservative:
   an explicit, separate invocation/flag; there is no single command that
   goes from "nothing" to "127,601 live requests" by accident or by
   forgetting a flag.
-- **No silent full-corpus default.** If invoked with no scope-limiting
-  input at all (no `--from-list`, no explicit count cap), refuse to run
-  rather than defaulting to "fetch everything this storage says is
-  missing" — the scope of a run should always be something the caller
-  named on purpose.
+- **No silent full-corpus default, no independent discovery.**
+  `--from-list <file>` is mandatory — no file, no run (loud error). There
+  is no mode that scans the local storage on its own to decide what's
+  missing; the scope of a run is always a list the caller already
+  produced on purpose (e.g. from a prior `casc-tool` dry-run), never
+  something this tool goes and discovers for itself.
 - **Every request logged**, plain append-only log (URL, host, timing,
   result, retry count) — auditable after the fact, not just a live progress
   bar that scrolls away. This is the same "state visibility" principle
@@ -229,19 +234,71 @@ open to reference:
 ```
 1. Open local CASC storage read-only (vendored CascLib), same access
    pattern as casc-tool.
-2. Build the worklist:
-     - if --from-list <file> given: use exactly those FileDataIDs
-       (still filtered through the storage's own bFileAvailable check --
-       don't re-fetch something already local)
-     - else: scan the whole storage (CascFindFirstFile/NextFile), collect
-       every entry with a real FileDataID, bFileAvailable=false, and not
-       content-flagged encrypted (encrypted-but-undownloaded needs a TACT
-       key too -- fetching ciphertext nobody can decrypt yet isn't useful
-       output; leave that bucket for a future pass once keys exist, don't
-       silently fetch it as if it were done)
-   Either way, resolve each ID's real EKey/CKey/ContentSize from the local
-   manifest -- this is what makes the CDN URL and lets a post-fetch hash
-   check happen.
+2. Build the worklist -- `--from-list <file>` is mandatory, one mode only:
+   no file, no run (loud error, not a silent fallback). This tool is a
+   companion that fetches a named list someone already decided on ("I've
+   done a dry run, here's the list I want, get the ones I'm missing"),
+   never an independent scanner that goes and discovers what's missing on
+   its own -- that's a fundamentally different, much larger action and
+   deserves its own deliberate invocation elsewhere, not a default here.
+   Use exactly the listed FileDataIDs, filtered through the storage's own
+   bFileAvailable check (don't re-fetch something already local). Resolve
+   each surviving ID's real EKey/CKey from the local manifest -- this is
+   what makes the CDN URL and lets a post-fetch hash check happen.
+
+   **Open gap, found while implementing this step (2026-08-16), not yet
+   resolved**: the original plan for this step also pre-filtered
+   content-flagged-encrypted entries before fetching (encrypted-but-
+   undownloaded needs a TACT key too; fetching ciphertext nobody can
+   decrypt yet isn't useful output). Verified against a real install that
+   this filter is not achievable as planned: CascLib's only public way to
+   read a file's content flags, `CascGetFileInfo(CascFileFullInfo)`, calls
+   `EnsureFileSpanFramesLoaded` unconditionally (`CascReadFile.cpp:741`),
+   which has to open the local data-archive stream -- and that fails by
+   construction for a file this install never downloaded, before content
+   flags are ever read. (Confirmed the flags themselves don't need the
+   stream -- `TFileTreeRoot::GetInfo`, `common/RootHandler.cpp:106`, is a
+   cheap in-memory lookup -- it's `CascGetFileInfo`'s public surface that
+   bundles that cheap lookup behind the stream-dependent size query,
+   with no way to ask for one without the other.) CKey/EKey don't have
+   this problem (`CascFileContentKey`/`CascFileEncodedKey` read straight
+   off the CKey-table entry, no stream needed) and content size has the
+   same problem as content flags, so a missing file's size is equally
+   unknown pre-fetch. Net effect: for a file this install never
+   downloaded, tact-fetch can get its EKey/CKey but not its size or
+   encryption status, through any public CascLib API, without either (a)
+   a `CascFindFirstFile`-based lookup -- confirmed to be a linear scan
+   internally (`TFileTreeRoot::Search`, `common/RootHandler.cpp:72`), the
+   exact mechanism §7 step 2 above was written to avoid -- or (b) reaching
+   into CascLib's internal `TCascStorage`/root-handler structures, which
+   isn't a supported public interface.
+
+   **Resolved by Luna (2026-08-16, refined same day): detect post-fetch,
+   land at the real path with a postfixed extension, don't discard it.**
+   Encryption status is no longer a pre-fetch filter -- every `to_fetch`
+   entry gets fetched regardless of unknown flags (the raw CDN blob
+   still downloads and hash-verifies at the encoded-bytes level either
+   way). When `CascReadFile`'s BLTE decode surfaces
+   `ERROR_FILE_ENCRYPTED` afterward: the file is **not** written into
+   `tact_export/`'s normal tree under its real extension as if it were
+   usable content, and it is **not** silently dropped either. It lands
+   at its *real, otherwise-normal* path (or the `_unresolved/`
+   convention if the path isn't known) with `.encrypted` appended to the
+   filename -- `character/foo.m2` becomes `character/foo.m2.encrypted`
+   -- rather than in a separate subtree. The postfix is deliberately on
+   the full real filename, extension included, specifically so a
+   downstream consumer matching by extension (e.g. globbing `*.m2`)
+   never matches the encrypted placeholder: `foo.m2.encrypted` doesn't
+   end in `.m2`, so naive extension-based tooling skips it automatically
+   without needing to know this convention exists, while a human
+   browsing the tree still finds it sitting right next to where the real
+   file would be. Logged loudly (§5's per-event log, a result value
+   distinct from both "fetched" and "failed" -- "encrypted", not
+   swallowed into either) and called out prominently in the run's final
+   summary, not buried in a count. `to_fetch_unknown_size` in the current
+   implementation (`src/plan.cpp`) is the pre-fetch bookkeeping this
+   relies on: it counts entries whose encryption status is unknown until
+   the real fetch step (§9, not yet built) actually runs and finds out.
 3. --dry-run (default): report count, total bytes, estimated wall-clock
    time at the configured rate limit. No network touched. On success,
    writes a timestamped marker file to a known location (temp dir) keyed
@@ -254,14 +311,15 @@ open to reference:
    speed bump against "nothing → 127,601 live requests" happening because
    a stale mental model of the worklist got fed straight to a real run
    without a fresh look at what it actually contains. Given a fresh
-   marker: bounded worker pool (§5),
-   per-file: GET from the CDN path derived from .build.info's CDN
-   Path/Servers + the TACT archive URL convention (EKey-based path,
-   documented on wowdev.wiki -- verify against a real successful fetch
-   before trusting the exact path shape), verify the response hash against
-   the expected CKey/EKey, write to tact_export/<real-path-if-known, else
-   an _unresolved/ convention matching casc-tool's own>, checkpoint
-   (append to a resume log) on each success.
+   marker: bounded worker pool (§5), per-file fetch via a *second*,
+   independent CascLib storage handle (`CascOpenStorageEx(...,
+   bOnlineStorage=true)`) opened with `szLocalPath` pointed at our own
+   scratch directory, never the real install (see §9's fetch-pipeline
+   resolution) -- CascLib's own BLTE decode and CKey/EKey hash
+   verification run unmodified on the result, write to
+   tact_export/<real-path-if-known, else an _unresolved/ convention
+   matching casc-tool's own>, checkpoint (append to a resume log) on each
+   success.
 5. Final summary: fetched / failed (with reasons) / skipped-already-present
    counts, matching casc-tool's own extract-batch summary shape.
 ```
@@ -328,15 +386,131 @@ reader/agent never has to re-derive them:
     inside a hand-rolled client — §4's finding that CascLib's own fetch
     path is anonymous and un-paced by default is still true and still a
     gap this tool must close, just from the outside of CascLib's API
-    instead of by replacing it. **Open follow-up, not yet resolved**:
-    confirm `CascOpenStorageEx` actually accepts/exposes a way to set a
-    custom `User-Agent` and to throttle concurrent/in-flight requests
-    (§5's ceilings) — if the online-storage API can't be paced or
-    identified from the outside, that reopens this decision rather than
-    settling it. libcurl stays listed as the dependency this repo already
-    vendors/links (`nix/flake.nix`, `CMakeLists.txt`) pending that
-    confirmation; removing it is a follow-up if CascLib's path proves
-    sufficient on its own.
+    instead of by replacing it.
+  - **Follow-up resolved (2026-08-16): `CascOpenStorageEx`'s online path
+    cannot be paced or identified from outside via any public API.**
+    Checked directly against the vendored source, not assumed: the actual
+    per-file network fetch happens in `HttpDownloadFile`
+    (`CascFiles.cpp:1241`, `static`, no external linkage — unreachable
+    from outside the library), which opens a raw TCP socket
+    (`common/Sockets.cpp`) and sends a hand-built plaintext
+    `GET ... HTTP/1.1` (`common/FileStream.cpp:678`) on **port 80 only**
+    — no TLS anywhere in the socket code, no `User-Agent` header, no
+    concurrency, no retry, no `PfnProgressCallback`-style hook for
+    per-request control. This closes the follow-up rather than reopening
+    the decision: CascLib's online-fetch transport genuinely cannot be
+    identified or paced from the outside as shipped.
+  - **Fetch-pipeline resolution: keep CascLib's decode/verify, replace
+    only its download function, and isolate the cache off the real
+    install.** Two things make this tractable instead of a rewrite:
+    - `HttpDownloadFile` downloads each CDN blob to a **local cache path
+      first** (`CascFiles.cpp:1359`); BLTE decode and CKey/EKey hash
+      verification happen later, when `CascReadFile` reads that now-local
+      file through a completely separate provider
+      (`common/FileStream.cpp`'s `BaseFile_*`, one of three
+      interchangeable implementations of the same five-function-pointer
+      `TFileStream` interface alongside `BaseHttp_*`/`BaseMap_*`). Fetch
+      and decode/verify are already separate internally; only the fetch
+      half needs to change.
+    - That local cache path is **not hardcoded to the real install**:
+      `CascOpenStorageEx`'s `szLocalPath` argument is caller-supplied and
+      becomes `hs->szRootPath`/`szDataPath`, which is exactly what
+      `HttpDownloadFile` writes under. Pointing a *second*, independent
+      storage handle's `szLocalPath` at our own scratch directory (product
+      code given separately, `bOnlineStorage=true`,
+      `CascOpenStorage.cpp:1519` `CheckOnlineStorage` path) makes that
+      scratch dir CascLib's entire cache root for that handle — the real
+      install, opened separately and read-only for the worklist (§7 step
+      1), is never touched by anything fetch-related.
+    - Net shape: **two storage handles**, never one. Handle A: the real
+      install, local-only, read-only, used once to resolve each worklist
+      ID's EKey/CKey/ContentSize (§7 step 1) — no online feature, no
+      writes. Handle B: `bOnlineStorage=true`, `szLocalPath` = our own
+      scratch dir, used per-file to fetch (§7 step 4) — this is the
+      handle whose `HttpDownloadFile` gets patched to route through
+      libcurl (HTTP/2, real `User-Agent`, our own pacing/timeout/backoff
+      per §5) instead of the raw-socket client, writing into the same
+      scratch dir it already owns. Everything upstream (CDN host
+      selection, retry-across-hosts loop) and downstream (BLTE decode,
+      hash verification) of that one patched function is reused exactly
+      as CascLib already implements it — no reimplementation of BLTE, no
+      reimplementation of hash verification, and the real install's
+      `Data/` directory never appears as a write target anywhere in this
+      pipeline.
+- **Implemented (2026-08-16), and one more real cost found in the
+  process: opening handle B is not free, even for a one-file run.**
+  The `HttpDownloadFile` patch above is built (also patched
+  `RibbitDownloadFile`, the *other* raw-socket fetch function CascLib
+  uses for the one-time versions/cdns bootstrap every online storage
+  needs before `HttpDownloadFile` is ever called — same libcurl swap,
+  same reasoning, found necessary only once live-tested: opening handle
+  B against a real product without it left a live TCP connection to
+  Blizzard's Ribbit endpoint using CascLib's original no-timeout raw
+  socket client). Verified end to end against `us.patch.battle.net:1119`
+  and `level3.blizzard.com` (real product `wow`, region `eu`): DNS,
+  TCP, and the actual libcurl fetch all work correctly, HTTP status and
+  bytes come back as expected, `SaveLocalFile` writes to the scratch
+  dir exactly as designed, no writes ever touch the real install.
+  **But**: `CascOpenStorageEx(bOnlineStorage=true)`'s `LoadIndexFiles`
+  step (`CascIndexFiles.cpp`, `LoadArchiveIndexFiles` for
+  `BuildFileType == CascVersions`) downloads the CDN's **entire archive
+  index set** — not scoped to the worklist at all — before the handle
+  finishes opening. A live test for a single-file worklist (FileDataID
+  21) was still pulling individual `.index` files (463 of them, 41 MB,
+  interrupted before completion — the real total is unknown and
+  plausibly much larger for retail WoW's full archive set) minutes in.
+  This is CascLib's own online-mode design, not a bug introduced by the
+  libcurl patch — the raw-socket path would have paid the identical
+  cost, just slower and less politely. It's a **one-time cost per
+  scratch-dir lifetime** (the index files get cached under
+  `state_dir/online-cache` exactly like any other fetched blob, so a
+  second run against the same scratch dir wouldn't re-download them),
+  but it means the *first* `fetch` invocation against a fresh scratch
+  dir pays a large, worklist-size-independent bandwidth cost before a
+  single requested file is fetched — directly in tension with fetching
+  "exactly this small list, politely."
+
+  **Resolved by Luna (2026-08-16): not a cost to avoid, an index to
+  keep.** The archive index set is exactly what lets a CDN client (the
+  real Battle.net Agent, or us) know what's available and diff against
+  it later — reframed from "wasted bandwidth" to "a local asset worth
+  keeping, centrally, permanently, once." Three changes:
+    - **Central, persistent cache dir, not per-invocation scratch.**
+      `src/cache_dir.h`'s `TactFetchCacheDir()`
+      (`$XDG_CACHE_HOME/tact-fetch`, falling back to
+      `$HOME/.cache/tact-fetch`) replaces `state_dir/online-cache` as
+      handle B's `szLocalPath`, namespaced by `<product>-<region>`
+      (`src/fetch.cpp`). The expensive index bootstrap is now paid
+      **once per product/region, ever** — not once per scratch dir, and
+      never again once paid, across every future invocation from any
+      directory.
+    - **`CASC_FEATURE_FORCE_DOWNLOAD` for the small, mutable files.**
+      Without it, CascLib's own `LocalCaching()` would treat a
+      once-cached `versions`/`cdns` as good forever (`LoadCsvFile`,
+      `CascFiles.cpp`), meaning tact-fetch would never notice a new WoW
+      build after the first run. `src/fetch.cpp` now opens handle B via
+      `CascOpenStorageEx` directly (not the `CascOpenOnlineStorage`
+      convenience wrapper, which doesn't expose `dwFlags`) with that
+      flag set — `versions`/`cdns` (a few KB) are re-checked on every
+      `fetch`, while the CDN's content-addressed archive indices
+      (the actual expensive part, immutable once fetched) are
+      unaffected and still only fetched once, on a genuine cache miss.
+    - **Version history for `versions`/`cdns`.** These two files aren't
+      content-addressed (unlike everything else CascLib caches, which
+      is named by its own EKey hash and therefore naturally immutable),
+      so re-checking them on every run would otherwise just silently
+      overwrite whatever was there. The `RibbitDownloadFile` patch now
+      compares each freshly-fetched copy against what's currently
+      cached before overwriting it, and if it changed, snapshots the
+      old content into `<cache-root>/_history/<filename>.<unix-time>`
+      first -- a permanent, timestamped record of every build/CDN-config
+      change this tool has ever observed for that product/region,
+      not just whatever the CDN currently reports.
+  Compiles clean and passes the byte-identical patch-regeneration check
+  (`vendor/patches/README.md`); **not yet run against the real CDN** --
+  the original index-bootstrap live test was interrupted deliberately
+  before completion, so this resolution's actual bandwidth/behavior at
+  the real, persistent cache location hasn't been verified end to end.
 - **`tact_export/` naming**: mirror `casc-tool`'s own `wow_export/`
   convention *exactly and precisely* — real listfile-resolved path when
   known, `_unresolved/FILE########.dat` when not. The directory name

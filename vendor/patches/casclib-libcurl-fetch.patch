@@ -1,0 +1,260 @@
+--- a/src/CascFiles.cpp
++++ b/src/CascFiles.cpp
+@@ -17,6 +17,89 @@
+ #pragma comment(lib, "ws2_32.lib")          // Internet functions for HTTP stream
+ #endif
+ 
++// tact-fetch local patch (not upstream CascLib) -- see this repo's
++// DESIGN.md #9 and vendor/patches/README.md. HttpDownloadFile below is
++// swapped to fetch via libcurl instead of CascLib's own raw-socket
++// HTTP/1.1 client, so callers get HTTP/2 negotiation, TLS, a real
++// User-Agent and a real timeout; every other code path in this file
++// (CDN host/path selection, retry-across-hosts, local-cache-exists
++// check, disk write) is untouched.
++#include <curl/curl.h>
++#include <cstring>
++#include <ctime>
++#include <string>
++
++// tact-fetch's own DESIGN.md #5 politeness numbers, duplicated here
++// because this file builds as part of vendored CascLib, outside
++// tact-fetch's own src/politeness.h include path -- see that file for
++// the canonical values and the reasoning behind them.
++#define TACT_FETCH_HTTP_TIMEOUT_SECONDS 30L
++#define TACT_FETCH_USER_AGENT "tact-fetch/0.1 (+luna.niemitalo@gmail.com)"
++
++// Set after every libcurl attempt (success or failure) so tact-fetch's
++// own calling loop (src/fetch.cpp) can see the real HTTP status/headers
++// CascLib's DWORD error codes otherwise discard -- needed to honor a
++// 429/503 Retry-After per DESIGN.md #5 instead of always falling back to
++// generic backoff timing. Single-threaded fetch loop by design (#9), so
++// a plain global is enough; not thread-safe, deliberately.
++long g_tactFetchLastHttpStatus = 0;
++long g_tactFetchLastRetryAfterSeconds = 0;
++
++static size_t TactFetchCurlWrite(char * ptr, size_t size, size_t nmemb, void * userdata)
++{
++    std::string * pBuffer = (std::string *)userdata;
++    size_t cbAdded = size * nmemb;
++
++    pBuffer->append(ptr, cbAdded);
++    return cbAdded;
++}
++
++// Shared by HttpDownloadFile (bulk per-file "data" archive fetches) and
++// RibbitDownloadFile (the small one-time versions/cdns/buildconfig/
++// cdnconfig bootstrap an online storage handle needs before any per-file
++// fetch can happen) -- both were CascLib's own raw-socket HTTP/1.1
++// client before this patch, now both go through the same libcurl call
++// (HTTP/2, TLS, a real User-Agent, a real timeout).
++static bool TactFetchCurlGet(const char * szUrl, std::string & responseBody)
++{
++    CURL * curl = curl_easy_init();
++    if(curl == NULL)
++        return false;
++
++    curl_easy_setopt(curl, CURLOPT_URL, szUrl);
++    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
++    curl_easy_setopt(curl, CURLOPT_USERAGENT, TACT_FETCH_USER_AGENT);
++    curl_easy_setopt(curl, CURLOPT_TIMEOUT, TACT_FETCH_HTTP_TIMEOUT_SECONDS);
++    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
++    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, TactFetchCurlWrite);
++    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&responseBody);
++
++    CURLcode res = curl_easy_perform(curl);
++
++    long httpStatus = 0;
++    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpStatus);
++    g_tactFetchLastHttpStatus = httpStatus;
++
++    g_tactFetchLastRetryAfterSeconds = 0;
++#if LIBCURL_VERSION_NUM >= 0x073900   // CURLINFO_RETRY_AFTER added in curl 7.57.0
++    curl_off_t retryAfter = 0;
++    if(curl_easy_getinfo(curl, CURLINFO_RETRY_AFTER, &retryAfter) == CURLE_OK)
++        g_tactFetchLastRetryAfterSeconds = (long)retryAfter;
++#endif
++
++    curl_easy_cleanup(curl);
++
++    // Ribbit's "versions"/"cdns" bootstrap files are served with no
++    // HTTP status at all in some CascLib-tested configurations (status
++    // 0) -- treat 0 as "unknown, trust curl's own success/fail" rather
++    // than a hard failure, but still reject real 4xx/5xx.
++    if(res != CURLE_OK)
++        return false;
++    if(httpStatus != 0 && (httpStatus < 200 || httpStatus >= 300))
++        return false;
++    return true;
++}
++
+ //-----------------------------------------------------------------------------
+ // Local defines
+ 
+@@ -1175,9 +1258,6 @@
+ 
+ static DWORD RibbitDownloadFile(LPCTSTR szCdnHostUrl, LPCTSTR szProduct, LPCTSTR szFileName, CASC_PATH<TCHAR> & LocalPath, CASC_BLOB & FileData)
+ {
+-    CASC_PATH<TCHAR> LocalFile;
+-    TFileStream * pStream;
+-    ULONGLONG FileSize = 0;
+     TCHAR szRemoteUrl[256];
+     DWORD dwErrCode = ERROR_CAN_NOT_COMPLETE;
+ 
+@@ -1200,41 +1280,56 @@
+     // Old (HTTP) download: wget http://us.patch.battle.net:1119/wow_classic/cdns
+     CascStrPrintf(szRemoteUrl, _countof(szRemoteUrl), _T("%s/%s/%s"), szCdnHostUrl, szProduct, szFileName);
+ 
+-    // Open the file stream
+-    if((pStream = FileStream_OpenFile(szRemoteUrl, 0)) != NULL)
++    // tact-fetch local patch: this is the one-time versions/cdns/
++    // buildconfig/cdnconfig bootstrap an online storage handle needs
++    // before any per-file HttpDownloadFile call can happen -- same
++    // libcurl swap, same reasoning (see the comment above
++    // TactFetchCurlGet).
++    std::string responseBody;
++    if(TactFetchCurlGet(szRemoteUrl, responseBody) && responseBody.size() <= 0x04000000)
+     {
+-        if(FileStream_GetSize(pStream, &FileSize) && FileSize <= 0x04000000)
+-        {
+-            // Fill-in the file pointer and size
+-            if((dwErrCode = FileData.SetSize((size_t)FileSize)) == ERROR_SUCCESS)
+-            {
+-                if(FileStream_Read(pStream, NULL, FileData.pbData, (DWORD)FileSize))
+-                {
+-                    dwErrCode = ERROR_SUCCESS;
+-                }
+-                else
+-                {
+-                    dwErrCode = GetCascError();
+-                    FileData.Free();
+-                }
+-            }
+-        }
+-        else
+-        {
+-            dwErrCode = GetCascError();
+-        }
+-
+-        // Close the remote stream
+-        FileStream_Close(pStream);
++        dwErrCode = FileData.SetData(responseBody.data(), responseBody.size());
+     }
+     else
+     {
+-        dwErrCode = GetCascError();
++        dwErrCode = ERROR_CAN_NOT_COMPLETE;
+     }
+ 
+-    // Save the file to the local cache
++    // Save the file to the local cache. tact-fetch local patch: snapshot
++    // into a "_history" subfolder first, timestamped, but only if the
++    // content actually changed since last time -- CASC_FEATURE_FORCE_DOWNLOAD
++    // means this function now runs on every fetch call (see src/fetch.cpp),
++    // and only a genuine change (a new WoW build, a CDN config update) is
++    // worth keeping a permanent copy of. This is what gives "versions"/
++    // "cdns" real version history instead of just a single overwritten
++    // cache entry.
+     if(LocalPath.Length() && FileData.pbData && FileData.cbData && dwErrCode == ERROR_SUCCESS)
++    {
++        CASC_BLOB PreviousData;
++        bool bChanged = true;
++
++        if(LoadFileToMemory(LocalPath, PreviousData) == ERROR_SUCCESS)
++        {
++            bChanged = (PreviousData.cbData != FileData.cbData) ||
++                       (memcmp(PreviousData.pbData, FileData.pbData, FileData.cbData) != 0);
++        }
++
++        if(bChanged)
++        {
++            CASC_PATH<TCHAR> HistoryPath(LocalPath, NULL);
++            TCHAR szTimestamp[32];
++
++            HistoryPath.CutLastPart();
++            HistoryPath.AppendString(_T("_history"), true);
++            HistoryPath.AppendString(GetPlainFileName((LPCTSTR)LocalPath), true);
++            CascStrPrintf(szTimestamp, _countof(szTimestamp), _T(".%llu"), (unsigned long long)time(NULL));
++            HistoryPath.AppendString(szTimestamp, false);
++
++            SaveLocalFile(HistoryPath, FileData.pbData, FileData.cbData);
++        }
++
+         SaveLocalFile(LocalPath, FileData.pbData, FileData.cbData);
++    }
+     return dwErrCode;
+ }
+ 
+@@ -1245,59 +1340,21 @@
+     DWORD cbReadSize,
+     DWORD dwPortFlags)
+ {
+-    TFileStream * pRemStream;
+-    LPBYTE pbFileData;
+-    DWORD dwErrCode = ERROR_NOT_ENOUGH_MEMORY;
+-
+-    // Open the remote stream
+-    pRemStream = FileStream_OpenFile(szRemoteName, BASE_PROVIDER_HTTP | STREAM_PROVIDER_FLAT | dwPortFlags);
+-    if(pRemStream != NULL)
+-    {
+-        // Will we download the entire file or just a part of it?
+-        if(PtrByteOffset == NULL)
+-        {
+-            ULONGLONG FileSize = 0;
+-
+-            // Retrieve the file size, but not longer than 1 GB
+-            if(FileStream_GetSize(pRemStream, &FileSize))
+-            {
+-                // Verify valid size
+-                if(0 < FileSize && FileSize < CASC_MAX_ONLINE_FILE_SIZE)
+-                {
+-                    cbReadSize = (DWORD)FileSize;
+-                    dwErrCode = ERROR_SUCCESS;
+-                }
+-                else
+-                {
+-                    dwErrCode = ERROR_BAD_FORMAT;
+-                }
+-            }
+-            else
+-            {
+-                dwErrCode = GetCascError();
+-            }
+-        }
+-
+-        // Shall we read something?
+-        if((dwErrCode == ERROR_SUCCESS) && (cbReadSize != 0) && (pbFileData = CASC_ALLOC<BYTE>(cbReadSize)) != NULL)
+-        {
+-            // Read all required data from the remote file
+-            if(FileStream_Read(pRemStream, PtrByteOffset, pbFileData, cbReadSize))
+-                dwErrCode = SaveLocalFile(szLocalName, pbFileData, cbReadSize);
+-
+-            // Free the data buffer
+-            CASC_FREE(pbFileData);
+-        }
+-
+-        // Close the remote stream
+-        FileStream_Close(pRemStream);
+-    }
+-    else
+-    {
+-        dwErrCode = GetCascError();
+-    }
++    CASCLIB_UNUSED(cbReadSize);
++    CASCLIB_UNUSED(dwPortFlags);
++    CASCLIB_UNUSED(PtrByteOffset);
++    assert(PtrByteOffset == NULL);   // tact-fetch only ever does whole-file fetches (see FetchCascFile)
++
++    // szRemoteName is bare host+path with no scheme (BaseHttp_ParseURL's
++    // own convention, still used to build it in FetchCascFile above).
++    char szUrl[MAX_PATH + 16];
++    CascStrPrintf(szUrl, _countof(szUrl), "http://%s", szRemoteName);
++
++    std::string responseBody;
++    if(!TactFetchCurlGet(szUrl, responseBody))
++        return ERROR_CAN_NOT_COMPLETE;
+ 
+-    return dwErrCode;
++    return SaveLocalFile(szLocalName, (LPBYTE)responseBody.data(), responseBody.size());
+ }
+ 
+ DWORD SetProductCodeName(TCascStorage * hs, LPCSTR szCodeName, size_t nLength)

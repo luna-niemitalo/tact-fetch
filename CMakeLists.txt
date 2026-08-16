@@ -21,14 +21,29 @@ set(CASC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 add_subdirectory(vendor/CascLib)
 
-# CascLib is only ever used here for local manifest reads (FileDataID ->
-# EKey/CKey/ContentSize) -- see DESIGN.md #9. The actual CDN fetch goes
-# through libcurl instead of CascLib's own online-fetch path.
+# DESIGN.md #9's fetch-pipeline resolution: not a hand-rolled fetcher
+# bypassing CascLib, but a local patch to vendored CascLib's own
+# HttpDownloadFile (vendor/CascLib/src/CascFiles.cpp) so the existing
+# BLTE-decode/hash-verify pipeline keeps working unmodified. That patch
+# is what actually calls libcurl -- casc_static is a static archive
+# (just object files, no link step of its own), so the symbols it needs
+# only have to be satisfied when the final executable links, which is
+# why linking CURL::libcurl to tact-fetch here is enough. (Can't instead
+# add it as a casc_static usage requirement: CascLib's own CMakeLists.txt
+# calls target_link_libraries(casc_static ...) with the old plain
+# signature, and CMake refuses to mix that with a keyword-signature call
+# like PUBLIC/PRIVATE on the same target.)
 find_package(CURL REQUIRED)
 
-# Placeholder only -- see CLAUDE.md ## Status, nothing beyond this stub
-# exists yet. Not linked against casc_static or CURL::libcurl yet because
-# src/ doesn't call into either; both are wired into the build now so
-# `cmake --build` proves the vendoring/dependency shape works before any
-# real logic lands on top of it.
-add_executable(tact-fetch src/main.cpp)
+add_executable(tact-fetch
+  src/main.cpp
+  src/build_info.cpp
+  src/cache_dir.cpp
+  src/casc_storage.cpp
+  src/dry_run.cpp
+  src/fetch.cpp
+  src/log.cpp
+  src/plan.cpp
+  src/worklist.cpp
+)
+target_link_libraries(tact-fetch PRIVATE casc_static CURL::libcurl)

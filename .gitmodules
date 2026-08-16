@@ -1,3 +1,0 @@
-[submodule "vendor/CascLib"]
-	path = vendor/CascLib
-	url = https://github.com/ladislav-zezula/CascLib.git

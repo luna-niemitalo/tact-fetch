@@ -15,10 +15,11 @@ these separate.
 
 ## Status
 
-**Nothing is built yet.** This repo currently holds only the design
-handoff and project scaffolding — no source, no CLI, no packaged binary.
-See `DESIGN.md` for the full architecture handoff and `CLAUDE.md`'s
-`## Status`/`## Resume` sections for exactly where things stand.
+The local-only half works: reading a real install's manifest, loading and
+validating a `--from-list` worklist, and the dry-run report. **The actual
+CDN fetch is not implemented** — it's a deliberate no-op scaffold that
+touches no network. See `CLAUDE.md`'s `## Status`/`## Resume` sections for
+exactly where things stand, and `DESIGN.md` for the full architecture.
 
 ## What you need before this works (once built)
 
