@@ -153,7 +153,12 @@ stay conservative:
 - **Every request logged**, plain append-only log (URL, host, timing,
   result, retry count) — auditable after the fact, not just a live progress
   bar that scrolls away. This is the same "state visibility" principle
-  casc-tool's own CLI follows (see §6).
+  casc-tool's own CLI follows (see §6). **The append happens synchronously,
+  in line, at the moment each event occurs** — not batched and flushed from
+  a queue — so a crash or kill mid-run still leaves a log that accounts for
+  everything that happened up to that instant. A logging strategy that
+  buffers and flushes periodically would silently lose exactly the events
+  most worth having: the ones right before an unclean exit.
 
 ## 6. Design principles to inherit from `casc-tool` (explicit, not vibes)
 
@@ -177,6 +182,13 @@ open to reference:
   submodule` at Nix-build time (see casc-tool's README "Why this needed
   more than 'just cmake'" for the exact rationale/mechanism); `direnv exec
   .` as the standard way to run any command, one command per shell block.
+- **No multi-step shell commands, no ad hoc loops.** A pipeline longer than
+  two stages (`cat x | grep y` is the ceiling, not the norm) is a script,
+  not a command line — write it as one. Once a script passes ~10 lines,
+  it's a persistent file in the repo, not a heredoc or an inline `for`.
+  Readability wins over brevity even for something meant to run once:
+  don't compress a script to fit a line budget at the cost of a reader
+  being able to follow it.
 - **`FAILURES.md` as an actual punch list, `CHANGELOG.md` as the archive.**
   Resolved findings move out of `FAILURES.md` into `CHANGELOG.md` the
   moment they're fixed — `FAILURES.md` should only ever list what's still
@@ -231,8 +243,18 @@ open to reference:
    manifest -- this is what makes the CDN URL and lets a post-fetch hash
    check happen.
 3. --dry-run (default): report count, total bytes, estimated wall-clock
-   time at the configured rate limit. No network touched.
-4. Real run (separate, explicit invocation): bounded worker pool (§5),
+   time at the configured rate limit. No network touched. On success,
+   writes a timestamped marker file to a known location (temp dir) keyed
+   to the resolved worklist, recording that a dry-run for *this* scope was
+   just completed.
+4. Real run (separate, explicit invocation): refuses to start — loud
+   error, not a silent no-op — unless a matching dry-run marker from step 3
+   exists and is fresh (**10 minutes**, laxer acceptable during
+   development but not the shipped default). This is a deliberate
+   speed bump against "nothing → 127,601 live requests" happening because
+   a stale mental model of the worklist got fed straight to a real run
+   without a fresh look at what it actually contains. Given a fresh
+   marker: bounded worker pool (§5),
    per-file: GET from the CDN path derived from .build.info's CDN
    Path/Servers + the TACT archive URL convention (EKey-based path,
    documented on wowdev.wiki -- verify against a real successful fetch
@@ -261,20 +283,71 @@ open to reference:
 - No relationship to `casc-tool` beyond the shared plain-text FileDataID
   worklist format — no shared code, no dependency in either direction.
 
-## 9. Open questions for whoever builds this
+## 9. Architecture decisions (resolved 2026-08-16)
 
-Deliberately left open rather than guessed at:
+Previously left open; decided by Luna, recorded here so a fresh
+reader/agent never has to re-derive them:
 
-- Build on `CascOpenOnlineStorage` directly (simpler, inherits CascLib's
-  own conservative sequential behavior, less control) vs. hand-rolled HTTP
-  with a real worker pool and resumable range requests (more control, more
-  code, more ways to accidentally be impolite if not careful)?
-- Exact on-disk `tact_export/` naming convention when a FileDataID has no
-  real listfile name available (mirror casc-tool's `_unresolved/
-  FILE########.dat`, or something distinct enough to signal "this came
-  from the CDN, not a local install extraction"?)
-- Should a completed `tact_export/` file, once verified, get merged back
-  into `wow_export/` by a human/another tool, or does it stay a genuinely
-  separate tree indefinitely? (Leaning separate, given the different
-  provenance/trust level of "fetched live from Blizzard" vs. "extracted
-  from a local install," but worth a real decision, not a default.)
+- **Hand-rolled HTTP, not `CascOpenOnlineStorage`.** Rejected the simpler
+  "inherit CascLib's own sequential fetch path" option: a deliberately
+  honest `User-Agent` plus real, chosen politeness limits (§5) is *more*
+  polite than CascLib's own anonymous, single-connection, no-retry
+  HTTP/1.1 client — anonymity isn't politeness, it's just untraceability.
+  Hand-rolling also opens the door to modern transport features HTTP/1.1
+  doesn't have — multiplexed/streaming requests, mid-request resume, real
+  backpressure/pacing — instead of HTTP/1.1's "one shot, die on the first
+  pothole" behavior. This means vendoring CascLib strictly for the local
+  manifest read (FileDataID → EKey/CKey/ContentSize), never for the actual
+  network fetch.
+  - **HTTP layer: libcurl, HTTP/2.** Chosen over a raw-socket
+    implementation or a minimal header-only client (`cpp-httplib`, HTTP/1.1
+    only): libcurl already gives multiplexing/streaming, resumable range
+    requests, per-request timeout, and easy custom `User-Agent` — the
+    concrete politeness primitives §5 asks for — without reimplementing
+    HTTP semantics from scratch. Available via nixpkgs; no vendoring
+    needed the way CascLib requires.
+  - **Revision (2026-08-16) — reversed in favor of `CascOpenStorageEx`
+    online mode.** Luna had a separate agent manually fetch one real,
+    critical file end to end against the live CDN. Empirical result:
+    `CascOpenStorageEx(..., bOnlineStorage=true)` works cleanly and, for
+    free, handles CDN URL resolution, **BLTE decode**, and content-hash
+    verification — all using code CascLib already ships. The hand-rolled
+    path above was scoped assuming the fetch itself was the hard part;
+    it wasn't accounting for BLTE (Blizzard's own chunked/compressed
+    archive format wrapping every CDN blob) needing a real decoder before
+    a fetched file is actually usable content — reimplementing that from
+    scratch for no benefit over what CascLib already does correctly is
+    not a reasonable trade against the politeness/transport gains hand-
+    rolling was chosen for. **Net decision: build on `CascOpenStorageEx`'s
+    online-storage path directly** rather than hand-rolled libcurl HTTP.
+    This does **not** relitigate §5's politeness policy — those limits
+    (concurrency ceiling, rate limiting, retry/backoff, honest
+    `User-Agent`) still apply and now have to be layered *around*
+    CascLib's online-fetch calls (e.g. a request gate/pacer wrapping each
+    `CascOpenFile`/read against an online storage handle) instead of
+    inside a hand-rolled client — §4's finding that CascLib's own fetch
+    path is anonymous and un-paced by default is still true and still a
+    gap this tool must close, just from the outside of CascLib's API
+    instead of by replacing it. **Open follow-up, not yet resolved**:
+    confirm `CascOpenStorageEx` actually accepts/exposes a way to set a
+    custom `User-Agent` and to throttle concurrent/in-flight requests
+    (§5's ceilings) — if the online-storage API can't be paced or
+    identified from the outside, that reopens this decision rather than
+    settling it. libcurl stays listed as the dependency this repo already
+    vendors/links (`nix/flake.nix`, `CMakeLists.txt`) pending that
+    confirmation; removing it is a follow-up if CascLib's path proves
+    sufficient on its own.
+- **`tact_export/` naming**: mirror `casc-tool`'s own `wow_export/`
+  convention *exactly and precisely* — real listfile-resolved path when
+  known, `_unresolved/FILE########.dat` when not. The directory name
+  itself (`tact_export/` vs `wow_export/`) already carries the
+  provenance signal ("this came from the CDN, not a local extraction");
+  the naming scheme underneath it doesn't need to re-encode that a second
+  way, and matching it exactly is what lets a downstream consumer (e.g.
+  `husk`) treat the two trees as interchangeable path-for-path.
+- **`tact_export/` stays a permanently separate tree** — no automatic or
+  tool-driven merge into `wow_export/`. Different provenance/trust level
+  (fetched live from Blizzard vs. extracted from a local install) stays
+  visible for as long as both trees exist; if a human ever wants to
+  collapse them, that's a manual, deliberate action outside this tool's
+  scope, not a feature to build.

@@ -1,0 +1,1 @@
+/home/luna/nix/claude-rules/nix.md
