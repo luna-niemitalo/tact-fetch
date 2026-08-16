@@ -7,6 +7,30 @@ nothing here is actionable. Newest first.
 
 ---
 
+## 2026-08-16 — Full pipeline verified end to end against the real install and real CDN
+
+Ran `fetch` for real, watched externally with a deliberate "interrupt if
+the cache exceeds 3 GiB" cap (never triggered) rather than an unbounded
+live test. Results:
+
+- The index bootstrap (previous entry's open question) completed in
+  ~2.5 minutes: **399 MB, 1346 `.index` files** for retail WoW/eu build
+  69299 — substantial, but well short of the multi-GB worst case the
+  earlier interrupted test left open.
+- The one targeted FileDataID (21) fetched, decoded, and hash-verified
+  correctly through CascLib's own unmodified pipeline: output
+  (`_unresolved/FILE00000015.dat`) is exactly 4,609,024 bytes, matching
+  `casc-tool`'s independently-reported size for the same ID byte for
+  byte.
+- `_history/` gained exactly one snapshot each for `versions` and
+  `cdns` — correct for a single run against a freshly-created cache.
+- The real install directory was confirmed untouched both before and
+  after (`find -newer` against a pre-session file, empty result both
+  times).
+
+This closes out the local-patch and central-cache work as verified, not
+just build-tested. Committed to `master` locally (not pushed).
+
 ## 2026-08-16 — Index-bootstrap cost reframed as a persistent asset, not overhead to avoid
 
 Luna's resolution to the previous entry's open finding: the CDN archive

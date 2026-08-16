@@ -42,12 +42,16 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   an architectural cost that Luna resolved by making the cache an
   intentional, persistent, versioned asset rather than something to
   avoid paying for).
-- **Target**: see `DESIGN.md` §7/§9. Everything described above matches
-  the target shape now. Still open: the central-cache/history resolution
-  above compiles clean but **has not been run against the real CDN yet**
-  (only build-verified) — and a `--listfile` flag (not built — every
-  fetch currently lands under `_unresolved/`, never a real resolved
-  path).
+- **Target**: see `DESIGN.md` §7/§9. Everything described above is
+  built **and verified end to end against the real install and real
+  CDN** (2026-08-16): a full, unbounded run completed the entire index
+  bootstrap in ~2.5 minutes (399 MB, 1346 `.index` files for retail
+  WoW/eu build 69299), fetched and correctly decoded the one targeted
+  FileDataID (output byte-for-byte matches `casc-tool`'s independently
+  reported size), and `_history/` gained exactly the one snapshot each
+  for `versions`/`cdns` that a single fresh-cache run should produce.
+  Only thing still open: a `--listfile` flag (not built — every fetch
+  currently lands under `_unresolved/`, never a real resolved path).
 - Anything not listed under Current does not exist yet. Do not describe it as working.
 
 ## Boundaries
@@ -114,18 +118,25 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
      `RibbitDownloadFile` patch snapshots every actual change to those
      two files into `_history/` before overwriting, so there's a
      permanent, timestamped record of every build/CDN-config change
-     ever observed, not just whatever's currently live. Compiles clean,
-     patch-regeneration verified byte-identical — **not yet run against
-     the real CDN** (the original live test was interrupted before this
-     resolution existed).
-- **Next step**: run `fetch` against the real CDN once more, letting the
-  index bootstrap actually complete this time against the new central
-  cache location, to confirm finding 3's resolution behaves as designed
-  end to end (central location used, force-download keeps `versions`/
-  `cdns` fresh, `_history/` actually accumulates snapshots on change).
-  This is a real, possibly large, deliberate bandwidth commitment (the
-  full archive index set, size still unknown) — worth flagging before
-  doing it rather than triggering it silently.
+     ever observed, not just whatever's currently live.
+  4. **Verified end to end (2026-08-16)**: a full run (watched
+     externally, capped at "interrupt past 3 GiB" — never triggered)
+     against the real install and real CDN completed the entire index
+     bootstrap in ~2.5 minutes: **399 MB, 1346 `.index` files** total
+     for retail WoW/eu build 69299 — large, but well short of the
+     multi-GB worst case finding 3 left open. The one targeted
+     FileDataID (21) fetched, decoded, and hash-verified correctly:
+     output is exactly 4,609,024 bytes, matching `casc-tool`'s
+     independently-reported size byte for byte. `_history/` gained
+     exactly one snapshot each for `versions`/`cdns` (correct for a
+     single run against a fresh cache). Real install confirmed
+     untouched before and after (`find -newer`, empty both times).
+- **Next step**: no open findings right now. Natural next pieces if
+  picked back up: a `--listfile` flag (so fetched files can land at
+  their real resolved path instead of always `_unresolved/`), and
+  actually exercising `_history/`'s accumulation behavior by running
+  `fetch` again after a real CDN change (a new WoW build/patch) to
+  confirm a second snapshot appears rather than none.
 - **Hazards**: `vendor/CascLib` is **not a git submodule** (removed 2026-08-16, was
   redundant with the flake input once a local patch needed keeping in
   sync across two places): it's materialized from the pinned `casclib`

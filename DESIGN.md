@@ -507,10 +507,22 @@ reader/agent never has to re-derive them:
       change this tool has ever observed for that product/region,
       not just whatever the CDN currently reports.
   Compiles clean and passes the byte-identical patch-regeneration check
-  (`vendor/patches/README.md`); **not yet run against the real CDN** --
-  the original index-bootstrap live test was interrupted deliberately
-  before completion, so this resolution's actual bandwidth/behavior at
-  the real, persistent cache location hasn't been verified end to end.
+  (`vendor/patches/README.md`). **Verified end to end (2026-08-16)**: a
+  full, unbounded run (capped only by a deliberate external "stop past
+  3 GiB" watchdog, never triggered) against the real install and real
+  CDN completed the entire index bootstrap in ~2.5 minutes, landing at
+  **399 MB, 1346 `.index` files** total for retail WoW/eu at build
+  69299 -- large, but nowhere near the multi-GB worst case the earlier
+  interrupted test left open. The one targeted FileDataID (21) fetched,
+  decoded, and hash-verified correctly: the output file
+  (`_unresolved/FILE00000015.dat`) is exactly 4,609,024 bytes, matching
+  `casc-tool`'s independently-reported size for the same ID byte for
+  byte. `_history/` correctly gained one snapshot each for `versions`
+  and `cdns` (the only fetch that's happened against this cache, so
+  exactly one snapshot per file is the correct outcome, not a bug --
+  the next run against an unchanged CDN state should add none). The
+  real install was confirmed untouched (`find -newer` against a
+  pre-session file, empty result) both before and after.
 - **`tact_export/` naming**: mirror `casc-tool`'s own `wow_export/`
   convention *exactly and precisely* — real listfile-resolved path when
   known, `_unresolved/FILE########.dat` when not. The directory name
