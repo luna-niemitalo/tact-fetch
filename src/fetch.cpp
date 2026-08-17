@@ -10,6 +10,7 @@
 #include "CascLib.h"
 #include "build_info.h"
 #include "cache_dir.h"
+#include "content_sniff.h"
 #include "dry_run.h"
 #include "log.h"
 #include "politeness.h"
@@ -33,9 +34,13 @@ namespace {
 // a real path and writes it under `export_root` proper. Until then it
 // stays under `_unresolved/`, matching casc-tool's own convention --
 // never mixed into the real tree just because CascLib decoded it.
-std::filesystem::path OutputPath(const std::filesystem::path& export_root, uint32_t file_data_id, bool encrypted) {
+// `extension` defaults to "dat" (CASC's own generic convention for an
+// unidentified blob) -- pass a sniffed one (content_sniff.h) when the
+// decoded bytes were actually available to check.
+std::filesystem::path OutputPath(const std::filesystem::path& export_root, uint32_t file_data_id, bool encrypted,
+                                  const std::string& extension = "dat") {
   char name[32];
-  std::snprintf(name, sizeof(name), "FILE%08X.dat", file_data_id);
+  std::snprintf(name, sizeof(name), "FILE%08X.%s", file_data_id, extension.c_str());
   std::filesystem::path path = export_root / "_unresolved" / name;
   if (encrypted) path += ".encrypted";
   return path;
@@ -108,7 +113,9 @@ FetchOutcome FetchOneFile(HANDLE online_storage, const std::filesystem::path& ex
     return {FetchKind::kFailed, "CascReadFile failed, CascLib error " + std::to_string(err)};
   }
 
-  std::filesystem::path out = OutputPath(export_root, entry.file_data_id, false);
+  std::string extension = SniffExtension(buffer);
+  std::filesystem::path out =
+      OutputPath(export_root, entry.file_data_id, false, extension.empty() ? "dat" : extension);
   if (!WriteFile(out, buffer.data(), bytes_read)) {
     return {FetchKind::kFailed, "decoded and verified, but writing to " + out.string() + " failed"};
   }

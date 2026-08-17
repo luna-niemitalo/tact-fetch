@@ -615,9 +615,31 @@ reader/agent never has to re-derive them:
   would make the tree look more resolved than it actually is. The real
   distinction the split exists for: `_unresolved/` is what this tool
   produces on its own; the real, listfile-resolved tree only gets
-  populated once something (a future `--listfile`-driven extraction
-  step, not built yet) takes a `_unresolved/` entry and resolves it to
-  its actual path.
+  populated once something takes a `_unresolved/` entry and resolves it
+  to its actual path. **Scoped 2026-08-17 (Luna): that resolution step
+  is `casc-tool`'s job, not a future tact-fetch flag** -- a separate pass
+  over `_unresolved/`'s output using `casc-tool`'s own exploration
+  tooling, not something to build into tact-fetch itself. Keeps the
+  boundary from §3 intact: tact-fetch fetches and verifies, nothing more;
+  `casc-tool` is where local-storage analysis/resolution already lives.
+- **`_unresolved/FILE########.<ext>` extension correction (added
+  2026-08-17)**: `<ext>` is content-sniffed (`src/content_sniff.cpp`),
+  not always `.dat` -- the decoded, hash-verified bytes are already in
+  hand right before writing, so checking the first few bytes against
+  known Blizzard/standard format magic signatures costs nothing extra
+  and beats lying about content already fully in hand. Every signature
+  used is empirically verified against a real file extracted from a
+  real install (2026-08-17), not taken from documentation alone: `MD21`/
+  `MD20` → `.m2`, `BLP2` → `.blp`, `SKIN` → `.skin`, `WDC*` → `.db2`,
+  `OggS` → `.ogg`, `RIFF`+`AVI ` → `.avi`. Deliberately does **not**
+  attempt `.wmo`/`.adt`/`.wdt`/`.wdl` detection: all four share the same
+  leading `MVER` chunk (stored reversed as `REVM`), so a magic-only
+  check can't tell them apart -- staying `.dat` is better than
+  confidently mislabeling. Still just a filename correction: the file
+  still lands under `_unresolved/`, since knowing *what kind* of file it
+  is isn't the same as knowing its real in-game *path* (that resolution
+  step is `casc-tool`'s job, per the naming-convention note above -- not
+  a future tact-fetch flag).
 - **`tact_export/` stays a permanently separate tree** — no automatic or
   tool-driven merge into `wow_export/`. Different provenance/trust level
   (fetched live from Blizzard vs. extracted from a local install) stays

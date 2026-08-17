@@ -24,11 +24,15 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   (`src/cache_dir.h` — central and persistent, `$XDG_CACHE_HOME/tact-fetch`
   or `$HOME/.cache/tact-fetch`, not per-invocation), fetches each
   `to_fetch` entry through it (retry/backoff/rate-limit per §5), and
-  writes decoded output under `--export/_unresolved/` as
-  `FILE########.dat` (briefly flattened 2026-08-16, reverted 2026-08-17
-  — see `DESIGN.md` §9's naming note: a CASC/BLTE-decoded blob isn't a
-  real game asset until something resolves it to its real path, so it
-  doesn't belong in the real tree yet) (`.encrypted`-postfixed if BLTE decode fails with
+  writes decoded output under `--export/_unresolved/` (briefly
+  flattened 2026-08-16, reverted 2026-08-17 — see `DESIGN.md` §9's
+  naming note: a CASC/BLTE-decoded blob isn't a real game asset until
+  something resolves it to its real path, so it doesn't belong in the
+  real tree yet) as `FILE########.<ext>`, `<ext>` content-sniffed
+  (`src/content_sniff.cpp`, added 2026-08-17 — real magic bytes verified
+  against real extracted files, not `.dat` by default anymore when the
+  format is recognized: `.m2`/`.blp`/`.skin`/`.db2`/`.ogg`/`.avi`)
+  (`.encrypted`-postfixed if BLTE decode fails with
   `ERROR_FILE_ENCRYPTED`). Vendored CascLib carries a **local patch**
   (not upstream): `HttpDownloadFile` and `RibbitDownloadFile`
   (`vendor/CascLib/src/CascFiles.cpp`) fetch via libcurl (HTTP/2, a real
@@ -64,9 +68,13 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   real files fetch, decode, and hash-verify correctly, encrypted files
   get a clean marker, and — after finding and fixing the whole-archive
   cost — genuinely new archive fetches land as small, correctly sparse
-  files (17–93 KB actual for individually-checked cases). Only thing
-  still open: a `--listfile` flag (not built — every fetch currently
-  lands under `--export/_unresolved/`, never a real resolved path).
+  files (17–93 KB actual for individually-checked cases), and extension
+  content-sniffing correctly identifies real formats instead of leaving
+  everything `.dat`. Only thing still open, and **scoped out of
+  tact-fetch entirely (2026-08-17, Luna)**: FileDataID → real-path
+  resolution is `casc-tool`'s job, a separate pass over `_unresolved/`
+  using its own exploration tooling — not a future tact-fetch flag, not
+  built yet, different repo.
 - Anything not listed under Current does not exist yet. Do not describe it as working.
 
 ## Boundaries
@@ -171,21 +179,48 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
      under) and could never find anything — simplified to an honest
      empty `.encrypted` marker instead of a broken "preserve the
      ciphertext" promise.
-- **Next step**: no open findings right now. Natural next pieces if
-  picked back up: a `--listfile` flag (so a resolved file can graduate
-  from `--export/_unresolved/FILE########.dat` to its real path under
-  `--export/` proper, instead of everything staying unresolved forever);
-  actually exercising `_history/`'s accumulation
-  behavior by running `fetch` again after a real CDN change (a new WoW
-  build/patch) to confirm a second snapshot appears rather than none;
-  optionally pruning the ~2.9 GB of fully-downloaded archives left in
-  the persistent cache from before finding 5's fix existed (harmless
-  leftover, not wrong, just no longer necessary at full size — the
-  specific ranges within them are still valid, only the surrounding
-  unused bytes are waste); and reconsidering whether the raw-ciphertext
-  preservation from finding 2 is worth a further CascLib patch exposing
-  the EKey-to-archive mapping, now that finding 5 explains exactly why
-  it silently never worked.
+  6. **Scope decision + a real analysis finding (2026-08-17)**: Luna
+     confirmed FileDataID→real-path resolution belongs entirely to
+     `casc-tool` (a separate pass over `_unresolved/`, its own
+     exploration tooling, different repo) — not a future tact-fetch
+     `--listfile` flag, closing that open question for good rather than
+     leaving it as "not built yet." In the same session, added
+     content-sniffed extension correction (`src/content_sniff.cpp`,
+     finding 6 continued below) and generated a full missing-files
+     report (`development/missing_report.csv`, gitignored, 156,299 rows:
+     FileDataId/ContentSize/Encrypted/LocaleFlags/Extension/Path,
+     cross-referenced against a local community listfile) for Luna's own
+     analysis. That report surfaced something worth recording here even
+     though it's not a tact-fetch code change: **the missing set for
+     this install is ~87% locale audio (`sound/*.ogg`) and cinematics,
+     essentially zero missing `.m2`/`.skin`/creature content** — so
+     tact-fetch's fetch list is not a fix for husk's texture-gap problem
+     (that's a "content already local but not read correctly, or
+     genuinely TACT-encrypted" question, not a "not yet downloaded"
+     one). Also fixed in generating that report: the local community
+     listfile has CRLF line endings that silently leak into joined CSV
+     fields if not stripped — cost an early version of the report
+     corrupted exact-match filtering (values compared equal to eye but
+     not to `==`); regenerated clean, worth remembering for any future
+     listfile-based analysis in this repo.
+- **Next step**: no open findings right now, and the biggest open
+  question (who does path resolution) is now closed. Natural next
+  pieces if picked back up: build the `casc-tool` side of path
+  resolution (separate repo, separate session) -- read `casc-tool`'s own
+  `CLAUDE.md`/`DESIGN.md` conventions first, this repo's own rules don't
+  apply there; consider whether xattr-based FileDataID tagging
+  (`user.tact.filedataid`, discussed but not built) is worth adding once
+  that resolution step exists and actually renames files; actually
+  exercising `_history/`'s accumulation behavior by running `fetch`
+  again after a real CDN change (a new WoW build/patch) to confirm a
+  second snapshot appears rather than none; optionally pruning the
+  ~2.9 GB of fully-downloaded archives left in the persistent cache from
+  before finding 5's fix existed (harmless leftover, not wrong, just no
+  longer necessary at full size — the specific ranges within them are
+  still valid, only the surrounding unused bytes are waste); and
+  reconsidering whether the raw-ciphertext preservation from finding 2
+  is worth a further CascLib patch exposing the EKey-to-archive mapping,
+  now that finding 5 explains exactly why it silently never worked.
 - **Hazards**: `vendor/CascLib` is **not a git submodule** (removed 2026-08-16, was
   redundant with the flake input once a local patch needed keeping in
   sync across two places): it's materialized from the pinned `casclib`

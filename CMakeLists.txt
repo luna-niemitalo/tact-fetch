@@ -40,6 +40,7 @@ add_executable(tact-fetch
   src/build_info.cpp
   src/cache_dir.cpp
   src/casc_storage.cpp
+  src/content_sniff.cpp
   src/dry_run.cpp
   src/fetch.cpp
   src/log.cpp

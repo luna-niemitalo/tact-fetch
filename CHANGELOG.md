@@ -7,6 +7,42 @@ nothing here is actionable. Newest first.
 
 ---
 
+## 2026-08-17 — Extension content-sniffing added; listfile resolution scoped to `casc-tool` for good
+
+`src/content_sniff.{h,cpp}` added: fetched files under `_unresolved/`
+now get a real extension when the content is recognizable
+(`.m2`/`.blp`/`.skin`/`.db2`/`.ogg`/`.avi`) instead of always `.dat` --
+the decoded, hash-verified bytes are already in hand right before
+writing, so checking a magic signature costs nothing extra. Every
+signature was verified against a real file extracted from the real
+install first, not taken from documentation (`MD21`/`MD20`, `BLP2`,
+`SKIN`, `WDC*`, `OggS`, `RIFF`+`AVI `). Deliberately skips `.wmo`/`.adt`/
+`.wdt`/`.wdl`: all four share the same leading `MVER` chunk, so a
+magic-only check can't disambiguate them -- staying `.dat` beats a
+confident wrong guess. Live-verified with one real fetch (FileDataID
+1047886 → `FILE000FFD4E.ogg`, content confirmed to actually start with
+`OggS`).
+
+Also: FileDataID→real-path resolution, previously described as "a
+future tact-fetch `--listfile` flag, not built yet," is now explicitly
+scoped to `casc-tool` instead -- a separate pass over `_unresolved/`
+using its own exploration tooling, never a tact-fetch feature. Closes
+that open question rather than leaving it open-ended.
+
+Generated a full missing-files report for Luna's own analysis
+(`development/missing_report.csv`, gitignored, 156,299 rows) by
+cross-referencing a fresh local scan against a local community listfile
+CSV. Found and fixed a real data-quality bug in generating it: the
+listfile has CRLF line endings that silently leak a trailing `\r` into
+every joined field -- invisible when printed, but breaks exact-string
+filtering (`$5=="ogg"` silently matching nothing). Regenerated with `\r`
+stripped. The report itself surfaced something worth recording even
+though it's not a code change: this install's missing set is ~87%
+locale audio and cinematics, essentially zero missing models/creature
+content -- tact-fetch's fetch list isn't a fix for husk's texture-gap
+problem, that content is either already local or genuinely encrypted,
+not "not yet downloaded."
+
 ## 2026-08-17 — `_unresolved/` output nesting restored
 
 Reverted the previous entry's naming change on the same day, per Luna:
