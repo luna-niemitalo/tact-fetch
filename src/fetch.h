@@ -22,15 +22,16 @@ namespace tactfetch {
 // `.build.info`'s product/region (needed to open the online handle),
 // never written to.
 //
-// Successfully decoded files land directly under `export_root/`, named
-// `FILE########.dat` (no --listfile support yet, so no real path is
-// ever known -- there's no `_unresolved/` subfolder to distinguish that
-// from a resolved path, since none ever exist yet). A file whose BLTE
-// decode fails with ERROR_FILE_ENCRYPTED lands at the same path with
-// `.encrypted` appended to the filename, holding the raw (still-encoded)
-// fetched bytes -- visible and inspectable later, never silently
-// dropped, and never mistaken for real decoded content by an
-// extension-matching consumer.
+// Successfully decoded files land under `export_root/_unresolved/`,
+// named `FILE########.dat` -- CASC/BLTE-decoded bytes are not yet a real
+// game asset until something resolves the FileDataID to its real
+// in-game path (a future --listfile-driven extraction step, not built
+// yet) and writes it under `export_root/` proper. This tool only ever
+// produces the unresolved half; nothing here writes into the real tree.
+// A file whose BLTE decode fails with ERROR_FILE_ENCRYPTED lands at the
+// same path with `.encrypted` appended to the filename -- visible and
+// inspectable later, never silently dropped, and never mistaken for
+// real decoded content by an extension-matching consumer.
 bool RunFetch(const PlanSummary& plan, const std::filesystem::path& install_path,
               const std::filesystem::path& state_dir, const std::filesystem::path& export_root);
 

@@ -603,17 +603,21 @@ reader/agent never has to re-derive them:
   preserving the actual raw bytes isn't achievable from outside CascLib
   without exposing its internal EKey-to-archive mapping, which is a
   further patch to consider later, not a quick fix to bolt on here.
-- **`tact_export/` naming**: real listfile-resolved path when known (not
-  implemented yet, no `--listfile` flag exists), `FILE########.dat`
-  **directly under `tact_export/`** when not — revised 2026-08-16 (Luna):
-  originally specified as `_unresolved/FILE########.dat`, mirroring
-  `casc-tool`'s own `wow_export/` convention exactly; dropped the
-  `_unresolved/` nesting once real usage showed it added a layer with no
-  payoff while `--listfile` support doesn't exist to ever populate the
-  other half of that split. If `--listfile` support is added later,
-  revisit whether reintroducing a real/unresolved split is worth it once
-  both cases genuinely occur side by side — for now, everything is
-  unresolved, so a split has nothing to split.
+- **`tact_export/` naming**: `_unresolved/FILE########.dat` when a
+  fetched file's real in-game path isn't known (true of everything
+  right now — no `--listfile` support exists yet), matching
+  `casc-tool`'s own `wow_export/` convention exactly. Briefly revised
+  2026-08-16 to drop that nesting (flat `FILE########.dat` directly
+  under `tact_export/`), then reverted 2026-08-17 (Luna): a
+  CASC/BLTE-decoded blob named only by FileDataID is not yet a real game
+  asset — it's still a "casc-like" intermediate, not a `.m2`/`.blp`/etc.
+  the way a real extraction is. Mixing that into `tact_export/`'s root
+  would make the tree look more resolved than it actually is. The real
+  distinction the split exists for: `_unresolved/` is what this tool
+  produces on its own; the real, listfile-resolved tree only gets
+  populated once something (a future `--listfile`-driven extraction
+  step, not built yet) takes a `_unresolved/` entry and resolves it to
+  its actual path.
 - **`tact_export/` stays a permanently separate tree** — no automatic or
   tool-driven merge into `wow_export/`. Different provenance/trust level
   (fetched live from Blizzard vs. extracted from a local install) stays

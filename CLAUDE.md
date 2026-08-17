@@ -24,9 +24,11 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   (`src/cache_dir.h` — central and persistent, `$XDG_CACHE_HOME/tact-fetch`
   or `$HOME/.cache/tact-fetch`, not per-invocation), fetches each
   `to_fetch` entry through it (retry/backoff/rate-limit per §5), and
-  writes decoded output directly under `--export/` as `FILE########.dat`
-  (no `_unresolved/` nesting — removed 2026-08-16, see `DESIGN.md` §9's
-  naming revision) (`.encrypted`-postfixed if BLTE decode fails with
+  writes decoded output under `--export/_unresolved/` as
+  `FILE########.dat` (briefly flattened 2026-08-16, reverted 2026-08-17
+  — see `DESIGN.md` §9's naming note: a CASC/BLTE-decoded blob isn't a
+  real game asset until something resolves it to its real path, so it
+  doesn't belong in the real tree yet) (`.encrypted`-postfixed if BLTE decode fails with
   `ERROR_FILE_ENCRYPTED`). Vendored CascLib carries a **local patch**
   (not upstream): `HttpDownloadFile` and `RibbitDownloadFile`
   (`vendor/CascLib/src/CascFiles.cpp`) fetch via libcurl (HTTP/2, a real
@@ -64,7 +66,7 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   cost — genuinely new archive fetches land as small, correctly sparse
   files (17–93 KB actual for individually-checked cases). Only thing
   still open: a `--listfile` flag (not built — every fetch currently
-  lands directly under `--export/`, never a real resolved path).
+  lands under `--export/_unresolved/`, never a real resolved path).
 - Anything not listed under Current does not exist yet. Do not describe it as working.
 
 ## Boundaries
@@ -170,9 +172,10 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
      empty `.encrypted` marker instead of a broken "preserve the
      ciphertext" promise.
 - **Next step**: no open findings right now. Natural next pieces if
-  picked back up: a `--listfile` flag (so fetched files can land at
-  their real resolved path instead of always flat `FILE########.dat`
-  under `--export/`); actually exercising `_history/`'s accumulation
+  picked back up: a `--listfile` flag (so a resolved file can graduate
+  from `--export/_unresolved/FILE########.dat` to its real path under
+  `--export/` proper, instead of everything staying unresolved forever);
+  actually exercising `_history/`'s accumulation
   behavior by running `fetch` again after a real CDN change (a new WoW
   build/patch) to confirm a second snapshot appears rather than none;
   optionally pruning the ~2.9 GB of fully-downloaded archives left in

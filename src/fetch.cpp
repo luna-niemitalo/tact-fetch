@@ -26,10 +26,17 @@ namespace tactfetch {
 
 namespace {
 
+// A fetched-and-decoded file is not yet a real game asset -- it's raw
+// CASC/BLTE-decoded bytes named by FileDataID, not by its in-game path.
+// It only becomes a real tree entry once something (a future
+// --listfile-driven extraction step, not built yet) resolves that ID to
+// a real path and writes it under `export_root` proper. Until then it
+// stays under `_unresolved/`, matching casc-tool's own convention --
+// never mixed into the real tree just because CascLib decoded it.
 std::filesystem::path OutputPath(const std::filesystem::path& export_root, uint32_t file_data_id, bool encrypted) {
   char name[32];
   std::snprintf(name, sizeof(name), "FILE%08X.dat", file_data_id);
-  std::filesystem::path path = export_root / name;
+  std::filesystem::path path = export_root / "_unresolved" / name;
   if (encrypted) path += ".encrypted";
   return path;
 }
@@ -207,7 +214,7 @@ bool RunFetch(const PlanSummary& plan, const std::filesystem::path& install_path
 
   std::cout << "fetch run:\n"
             << "  fetched:                 " << fetched << "\n"
-            << "  encrypted (see " << export_root.string() << "/*.encrypted): " << encrypted << "\n"
+            << "  encrypted (see " << export_root.string() << "/_unresolved/*.encrypted): " << encrypted << "\n"
             << "  failed:                  " << failed << "\n"
             << "  skipped-already-present: " << plan.already_local << "\n";
 

@@ -7,6 +7,17 @@ nothing here is actionable. Newest first.
 
 ---
 
+## 2026-08-17 — `_unresolved/` output nesting restored
+
+Reverted the previous entry's naming change on the same day, per Luna:
+a CASC/BLTE-decoded blob named only by FileDataID isn't a real game
+asset yet -- it's still a "casc-like" intermediate, not a `.m2`/`.blp`/
+etc. the way a real extraction is. It belongs under
+`tact_export/_unresolved/`, matching `casc-tool`'s own convention;
+`tact_export/`'s real tree should only ever be populated by resolving a
+FileDataID to its actual in-game path (a future `--listfile`-driven
+extraction step, not built yet), never by CascLib's own decode alone.
+
 ## 2026-08-17 — Whole-archive fetch found and fixed with real HTTP Range support, verified per-file
 
 Ran a 400-ID random-sample fetch smoke test as requested. First had to
