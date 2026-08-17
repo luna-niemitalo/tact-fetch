@@ -7,6 +7,59 @@ nothing here is actionable. Newest first.
 
 ---
 
+## 2026-08-17 — Whole-archive fetch found and fixed with real HTTP Range support, verified per-file
+
+Ran a 400-ID random-sample fetch smoke test as requested. First had to
+fix the test input: `casc_missing_fileids.txt` (provided as the source
+list) turned out stale -- a fresh scan confirmed only 1 of its 18,747
+IDs was still actually missing, the rest had since been downloaded by
+the client. Wrote a small one-off scanner (not part of tact-fetch, which
+deliberately never scans) to get a current, ground-truth missing-files
+list (156,299 entries, matching `DESIGN.md` #2's original count exactly)
+and sampled 400 from that instead.
+
+The smoke test surfaced a second real architectural cost, bigger than
+the index-bootstrap one: `FetchCascFile` fetches the *entire* CDN
+archive (confirmed at exactly 268,435,456 bytes -- 256 MiB) that a
+requested file happens to be packed into, not just that file's own
+bytes. Confirmed in the unpatched vendored source (`CascFiles.cpp`): the
+archive-info overload substitutes the archive's own key for the
+requested file's key before ever fetching, always whole-file. True of
+CascLib before this project touched it, not something the libcurl patch
+introduced.
+
+Resolution (Luna's call, with an explicit instruction to validate before
+trusting it): `FetchRemoteArchiveRange`, a new function in the same
+CascLib patch, issues a real `CURLOPT_RANGE` request for exactly the
+needed span, verifies the response is genuinely partial (HTTP 206 and
+the exact requested byte count -- a server that ignores `Range` and
+answers `200` with the full body is treated as a hard failure, not
+silently accepted), and writes the fetched bytes into a sparse local
+file at the correct offset with a `.ranges` sidecar tracking what's
+already been pulled into that archive proxy. No whole-file fallback on
+Range failure.
+
+Verified per-file, twice, not just asserted from the patch's intent: 12
+freshly-created archive-proxy files totaled 504 KB of actual disk usage
+(`du`, real filesystem blocks) against ~1.07 GB of apparent/logical size
+(the offset-correct sparse-file size) -- individually confirmed, not
+just in aggregate (a naive whole-directory `du` delta was initially
+misleading, conflating new growth with ~2.9 GB of already-existing
+archives left over from before this patch existed in the same
+persistent cache). A second run confirmed the same pattern (9 new
+archives, 489 KB actual).
+
+Side effect, also fixed: `src/fetch.cpp`'s encrypted-file raw-bytes
+preservation was looking for cached content at the file's own EKey path,
+but the cache has always been keyed by the archive's key -- it could
+never have worked, just never got exercised until this session's smoke
+test actually hit encrypted files. Simplified to an honest empty
+`.encrypted` marker.
+
+`vendor/patches/casclib-libcurl-fetch.patch` regenerated and verified
+byte-identical after a clean re-apply; both `cmake --build` and
+`nix build ./nix#default` rebuilt clean from scratch.
+
 ## 2026-08-16 — Full pipeline verified end to end against the real install and real CDN
 
 Ran `fetch` for real, watched externally with a deliberate "interrupt if

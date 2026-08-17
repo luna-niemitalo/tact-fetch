@@ -24,8 +24,9 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   (`src/cache_dir.h` — central and persistent, `$XDG_CACHE_HOME/tact-fetch`
   or `$HOME/.cache/tact-fetch`, not per-invocation), fetches each
   `to_fetch` entry through it (retry/backoff/rate-limit per §5), and
-  writes decoded output to `--export/_unresolved/`
-  (`.encrypted`-postfixed if BLTE decode fails with
+  writes decoded output directly under `--export/` as `FILE########.dat`
+  (no `_unresolved/` nesting — removed 2026-08-16, see `DESIGN.md` §9's
+  naming revision) (`.encrypted`-postfixed if BLTE decode fails with
   `ERROR_FILE_ENCRYPTED`). Vendored CascLib carries a **local patch**
   (not upstream): `HttpDownloadFile` and `RibbitDownloadFile`
   (`vendor/CascLib/src/CascFiles.cpp`) fetch via libcurl (HTTP/2, a real
@@ -35,23 +36,35 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   stale) while the CDN's big content-addressed archive indices still
   only fetch once; `RibbitDownloadFile` snapshots every actual change to
   `versions`/`cdns` into `<cache-root>/_history/<name>.<unix-time>`
-  before overwriting, giving real version history. Everything else in
-  CascLib's fetch/decode/verify pipeline is untouched.
+  before overwriting, giving real version history. `FetchCascFile`'s
+  archive-info overload (`FetchRemoteArchiveRange`, added 2026-08-17)
+  fetches only a file's actual byte range out of its containing CDN
+  archive via a real, response-verified HTTP Range request, instead of
+  the whole (up to 256 MB) archive segment CascLib's own unpatched
+  `FetchCascFile` would otherwise pull — see `DESIGN.md` §9's live
+  finding for why this was necessary and how it was verified (not just
+  asserted). Everything else in CascLib's fetch/decode/verify pipeline
+  is untouched.
   Verified against the real install and real network (see `## Resume` for
-  what that verification actually found — a locale-mask bug, fixed, and
-  an architectural cost that Luna resolved by making the cache an
-  intentional, persistent, versioned asset rather than something to
-  avoid paying for).
+  what that verification actually found — a locale-mask bug, fixed; an
+  architectural cost Luna resolved by making the cache an intentional,
+  persistent, versioned asset; and a second architectural finding
+  (whole-archive fetches) resolved with real Range-request support,
+  verified per-file at 504 KB actual disk usage against ~1.07 GB of
+  logical size for the files checked).
 - **Target**: see `DESIGN.md` §7/§9. Everything described above is
   built **and verified end to end against the real install and real
-  CDN** (2026-08-16): a full, unbounded run completed the entire index
-  bootstrap in ~2.5 minutes (399 MB, 1346 `.index` files for retail
-  WoW/eu build 69299), fetched and correctly decoded the one targeted
-  FileDataID (output byte-for-byte matches `casc-tool`'s independently
-  reported size), and `_history/` gained exactly the one snapshot each
-  for `versions`/`cdns` that a single fresh-cache run should produce.
-  Only thing still open: a `--listfile` flag (not built — every fetch
-  currently lands under `_unresolved/`, never a real resolved path).
+  CDN** (2026-08-16 – 2026-08-17): a full, unbounded run completed the
+  entire index bootstrap in ~2.5 minutes (399 MB, 1346 `.index` files
+  for retail WoW/eu build 69299); a 400-ID random-sample smoke test
+  (from a freshly-scanned, ground-truth-verified missing-files list, not
+  the stale `casc_missing_fileids.txt` originally provided) confirmed
+  real files fetch, decode, and hash-verify correctly, encrypted files
+  get a clean marker, and — after finding and fixing the whole-archive
+  cost — genuinely new archive fetches land as small, correctly sparse
+  files (17–93 KB actual for individually-checked cases). Only thing
+  still open: a `--listfile` flag (not built — every fetch currently
+  lands directly under `--export/`, never a real resolved path).
 - Anything not listed under Current does not exist yet. Do not describe it as working.
 
 ## Boundaries
@@ -131,12 +144,45 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
      exactly one snapshot each for `versions`/`cdns` (correct for a
      single run against a fresh cache). Real install confirmed
      untouched before and after (`find -newer`, empty both times).
+  5. **Second real cost, found live-testing (2026-08-17), resolved same
+     day, verified per-file before trusting it**: a 400-ID random-sample
+     smoke test (drawn from a freshly-scanned, ground-truth-verified
+     missing-files list — the `casc_missing_fileids.txt` Luna originally
+     pointed at was stale, only 1 of its 18,747 IDs was still actually
+     missing) revealed that `FetchCascFile` fetches the *entire*
+     containing CDN archive (confirmed up to 268,435,456 bytes exactly)
+     for any file packed inside one, not just that file's own bytes —
+     true of unpatched CascLib too, not something the libcurl patch
+     introduced. Resolution: `FetchRemoteArchiveRange`
+     (`vendor/CascLib/src/CascFiles.cpp`) issues a real HTTP Range
+     request for exactly the needed span, verified as genuinely partial
+     (206 + exact byte count, not a server silently sending the whole
+     body) before being trusted, and writes it into a sparse local file
+     at the correct offset — no whole-file fallback on failure. Per
+     Luna's explicit instruction to validate this before trusting it:
+     confirmed directly per-file, twice — 12 fresh archives at 504 KB
+     actual disk usage against ~1.07 GB apparent/logical size, then 9
+     more at 489 KB actual — not just asserted from the patch's intent.
+     A companion fix: the encrypted-file raw-bytes-preservation logic in
+     `src/fetch.cpp` was looking for cached content at the wrong path
+     (the file's own EKey, not the archive's key it's actually stored
+     under) and could never find anything — simplified to an honest
+     empty `.encrypted` marker instead of a broken "preserve the
+     ciphertext" promise.
 - **Next step**: no open findings right now. Natural next pieces if
   picked back up: a `--listfile` flag (so fetched files can land at
-  their real resolved path instead of always `_unresolved/`), and
-  actually exercising `_history/`'s accumulation behavior by running
-  `fetch` again after a real CDN change (a new WoW build/patch) to
-  confirm a second snapshot appears rather than none.
+  their real resolved path instead of always flat `FILE########.dat`
+  under `--export/`); actually exercising `_history/`'s accumulation
+  behavior by running `fetch` again after a real CDN change (a new WoW
+  build/patch) to confirm a second snapshot appears rather than none;
+  optionally pruning the ~2.9 GB of fully-downloaded archives left in
+  the persistent cache from before finding 5's fix existed (harmless
+  leftover, not wrong, just no longer necessary at full size — the
+  specific ranges within them are still valid, only the surrounding
+  unused bytes are waste); and reconsidering whether the raw-ciphertext
+  preservation from finding 2 is worth a further CascLib patch exposing
+  the EKey-to-archive mapping, now that finding 5 explains exactly why
+  it silently never worked.
 - **Hazards**: `vendor/CascLib` is **not a git submodule** (removed 2026-08-16, was
   redundant with the flake input once a local patch needed keeping in
   sync across two places): it's materialized from the pinned `casclib`

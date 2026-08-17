@@ -26,33 +26,10 @@ namespace tactfetch {
 
 namespace {
 
-std::string HexLower(const std::array<unsigned char, 16>& key) {
-  static const char kHex[] = "0123456789abcdef";
-  std::string out;
-  out.reserve(32);
-  for (unsigned char b : key) {
-    out.push_back(kHex[b >> 4]);
-    out.push_back(kHex[b & 0x0F]);
-  }
-  return out;
-}
-
-// Mirrors CASC_PATH::AppendEKey's on-disk convention exactly
-// (vendor/CascLib/src/common/Path.h, vendor/CascLib/src/CascFiles.cpp's
-// FetchCascFile): <root>/data/<hex[0:2]>/<hex[2:4]>/<full 32-char hex
-// EKey>, no extension. This is where the raw (still BLTE-encoded) fetched
-// bytes for a "data" file land in the online handle's own local cache,
-// regardless of whether CascReadFile can decode them afterward.
-std::filesystem::path RawCachePath(const std::filesystem::path& online_cache_dir,
-                                    const std::array<unsigned char, 16>& ekey) {
-  std::string hex = HexLower(ekey);
-  return online_cache_dir / "data" / hex.substr(0, 2) / hex.substr(2, 2) / hex;
-}
-
 std::filesystem::path OutputPath(const std::filesystem::path& export_root, uint32_t file_data_id, bool encrypted) {
   char name[32];
   std::snprintf(name, sizeof(name), "FILE%08X.dat", file_data_id);
-  std::filesystem::path path = export_root / "_unresolved" / name;
+  std::filesystem::path path = export_root / name;
   if (encrypted) path += ".encrypted";
   return path;
 }
@@ -79,25 +56,28 @@ struct FetchOutcome {
 // CascLib's own fetch-if-missing + BLTE decode + CKey/EKey hash
 // verification, all unmodified), then writes the result to
 // `export_root`.
-FetchOutcome FetchOneFile(HANDLE online_storage, const std::filesystem::path& online_cache_dir,
-                           const std::filesystem::path& export_root, const ResolvedEntry& entry) {
+FetchOutcome FetchOneFile(HANDLE online_storage, const std::filesystem::path& export_root,
+                           const ResolvedEntry& entry) {
   HANDLE file_handle = nullptr;
   if (!CascOpenFile(online_storage, CASC_FILE_DATA_ID(entry.file_data_id), 0, CASC_OPEN_BY_FILEID, &file_handle)) {
     return {FetchKind::kFailed, "CascOpenFile failed, CascLib error " + std::to_string(GetCascError())};
   }
 
+  // Deliberately doesn't try to preserve the raw (still-encoded) fetched
+  // bytes: those live in the online handle's own cache under the
+  // *archive's* key (DESIGN.md #9's range-fetch patch), never the
+  // individual file's own EKey, and CascLib doesn't expose that mapping
+  // publicly -- there's no supported way to locate them from here. Just
+  // an empty `.encrypted` marker: still visible, still distinct from
+  // both "fetched" and "failed", never silently dropped, just honest
+  // that the ciphertext itself isn't available to keep.
   auto handle_encrypted = [&]() -> FetchOutcome {
-    std::filesystem::path raw = RawCachePath(online_cache_dir, entry.ekey);
-    std::error_code ec;
-    if (!std::filesystem::exists(raw, ec)) {
-      return {FetchKind::kEncrypted, "encrypted; the raw fetch itself did not leave a cached blob to preserve"};
-    }
     std::filesystem::path out = OutputPath(export_root, entry.file_data_id, true);
+    std::error_code ec;
     std::filesystem::create_directories(out.parent_path(), ec);
-    std::filesystem::copy_file(raw, out, std::filesystem::copy_options::overwrite_existing, ec);
-    if (ec) {
-      return {FetchKind::kFailed, "encrypted, but copying the raw bytes to " + out.string() + " failed: " +
-                                       ec.message()};
+    std::ofstream marker(out, std::ios::binary | std::ios::trunc);
+    if (!marker) {
+      return {FetchKind::kFailed, "encrypted, but creating the marker at " + out.string() + " failed"};
     }
     return {FetchKind::kEncrypted, out.string()};
   };
@@ -191,7 +171,7 @@ bool RunFetch(const PlanSummary& plan, const std::filesystem::path& install_path
     FetchOutcome outcome{FetchKind::kFailed, "not attempted"};
 
     for (int attempt = 1; attempt <= politeness::kRetryMaxAttempts; ++attempt) {
-      outcome = FetchOneFile(online_storage, online_cache_dir, export_root, entry);
+      outcome = FetchOneFile(online_storage, export_root, entry);
       if (outcome.kind != FetchKind::kFailed) break;
 
       if (attempt == politeness::kRetryMaxAttempts) break;
@@ -227,7 +207,7 @@ bool RunFetch(const PlanSummary& plan, const std::filesystem::path& install_path
 
   std::cout << "fetch run:\n"
             << "  fetched:                 " << fetched << "\n"
-            << "  encrypted (see " << export_root.string() << "/_unresolved/*.encrypted): " << encrypted << "\n"
+            << "  encrypted (see " << export_root.string() << "/*.encrypted): " << encrypted << "\n"
             << "  failed:                  " << failed << "\n"
             << "  skipped-already-present: " << plan.already_local << "\n";
 

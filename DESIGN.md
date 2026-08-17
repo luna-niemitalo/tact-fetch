@@ -282,9 +282,10 @@ open to reference:
    `ERROR_FILE_ENCRYPTED` afterward: the file is **not** written into
    `tact_export/`'s normal tree under its real extension as if it were
    usable content, and it is **not** silently dropped either. It lands
-   at its *real, otherwise-normal* path (or the `_unresolved/`
-   convention if the path isn't known) with `.encrypted` appended to the
-   filename -- `character/foo.m2` becomes `character/foo.m2.encrypted`
+   at its *real, otherwise-normal* path (or directly under
+   `tact_export/` as `FILE########.dat`, §9's naming revision, if the
+   path isn't known) with `.encrypted` appended to the filename --
+   `character/foo.m2` becomes `character/foo.m2.encrypted`
    -- rather than in a separate subtree. The postfix is deliberately on
    the full real filename, extension included, specifically so a
    downstream consumer matching by extension (e.g. globbing `*.m2`)
@@ -523,14 +524,96 @@ reader/agent never has to re-derive them:
   the next run against an unchanged CDN state should add none). The
   real install was confirmed untouched (`find -newer` against a
   pre-session file, empty result) both before and after.
-- **`tact_export/` naming**: mirror `casc-tool`'s own `wow_export/`
-  convention *exactly and precisely* — real listfile-resolved path when
-  known, `_unresolved/FILE########.dat` when not. The directory name
-  itself (`tact_export/` vs `wow_export/`) already carries the
-  provenance signal ("this came from the CDN, not a local extraction");
-  the naming scheme underneath it doesn't need to re-encode that a second
-  way, and matching it exactly is what lets a downstream consumer (e.g.
-  `husk`) treat the two trees as interchangeable path-for-path.
+- **Found live (2026-08-17), resolved same day: `FetchCascFile` doesn't
+  fetch a small file's own bytes, it fetches the whole ~256 MB archive
+  segment that file happens to live in.** Blizzard packs many small game
+  files together into large numbered CDN archives. Confirmed directly in
+  the vendored source (`CascFiles.cpp:1437-1448`, unpatched CascLib
+  behavior, not something the libcurl patch introduced): the
+  archive-info `FetchCascFile` overload looks up a requested file's EKey
+  in the local archive index, then **substitutes the file's own key for
+  the entire containing archive's key** before fetching -- always a
+  whole-file fetch (`HttpDownloadFile(..., NULL, 0, 0)`, offset/size
+  params always zero), never a byte range, so the *entire* archive lands
+  on disk to extract one small file's worth of content. Confirmed
+  empirically: cached files sitting at exactly 268,435,456 bytes (256
+  MiB, to the byte). For a narrow/clustered worklist this amortizes fine
+  (many requested files often share the same few archives); for a
+  broad/scattered one (a random sample across the whole game, or the
+  real 156k-file target list if it isn't clustered by content type) it
+  could mean downloading a large fraction of the game's total archive
+  data -- a 400-file random-sample smoke test touched 7+ distinct
+  archives in under a dozen files.
+
+  **Resolution (Luna's call): add real HTTP Range-request support**,
+  keeping everything else CascLib already does. New functions in the
+  `HttpDownloadFile`/`RibbitDownloadFile` patch
+  (`vendor/CascLib/src/CascFiles.cpp`, same file, same posture -- small
+  additive patch, not a fork):
+    - `FetchRemoteArchiveRange` replaces the whole-file delegation in the
+      archive-info `FetchCascFile` overload, for online storage with no
+      local consolidated archives to fall back on (handle B). It issues
+      a real `CURLOPT_RANGE` request for exactly `[ArchiveOffs,
+      ArchiveOffs+EncodedSize)` -- both already known before the fetch,
+      from the same local archive-index lookup that used to just get
+      discarded in favor of the archive's key.
+    - The response is **verified, not trusted**: HTTP `206 Partial
+      Content` and the exact requested byte count are both required:
+      anything else (a CDN host that ignores `Range` and answers `200`
+      with the full body, say) is a hard failure, not silently accepted
+      as "good enough" -- accepting a full body here would silently
+      reintroduce the exact cost this patch exists to avoid.
+    - The fetched range is written into the local archive-proxy file **at
+      its real offset**, leaving everything else in that file as a
+      filesystem hole (a sparse file) -- `CascReadFile`'s later flat read
+      at that same offset works completely unaware anything is missing
+      elsewhere in the file, since it never looks anywhere else. No
+      fallback to the old whole-file path on Range failure: a failed
+      range fetch surfaces as a real error for `src/fetch.cpp`'s own
+      retry loop, never silently degrades into paying the avoided cost.
+    - A companion `<archive-proxy-path>.ranges` sidecar (one
+      `"offset length"` line per fetched span) tracks what's already
+      been pulled into that archive proxy, since the same archive can
+      accumulate ranges from files requested in different runs, and
+      "does the file exist" no longer means "is it complete" once it's a
+      sparse partial copy.
+  **Verified, not just asserted** (per Luna's explicit ask to check
+  this before trusting it): 12 freshly-created archive-proxy files from
+  a real fetch totaled **504 KB of actual disk usage** (`du`, real
+  filesystem blocks) against **~1.07 GB of apparent/logical size**
+  (`stat`/`ls -la`, the offset-correct sparse-file size) -- roughly a
+  2,175x reduction, individually confirmed per file, not just in
+  aggregate. A second, larger run confirmed the same pattern (9 new
+  archives, 489 KB actual) after an initial false alarm from a naive
+  aggregate-cache-size watchdog that conflated genuinely new growth with
+  ~2.9 GB of already-existing, fully-downloaded archives left over from
+  *before* this patch existed in the same persistent cache directory --
+  a measurement-methodology lesson (per-file verification is the
+  reliable signal; whole-directory size deltas are not, once old and new
+  data coexist), not a flaw in the fix itself.
+
+  **Side effect, also fixed**: `src/fetch.cpp`'s "preserve the raw
+  ciphertext for an encrypted file" logic (`DESIGN.md`'s earlier
+  encryption-handling revision) looked for the cached blob at the
+  *file's own* EKey path -- but the local cache was always keyed by the
+  *archive's* key (true before this patch too, just never actually
+  exercised/tested until now), so it could never find anything to
+  preserve. Simplified to an honest empty `.encrypted` marker (still
+  distinct from both "fetched" and "failed", never silently dropped) --
+  preserving the actual raw bytes isn't achievable from outside CascLib
+  without exposing its internal EKey-to-archive mapping, which is a
+  further patch to consider later, not a quick fix to bolt on here.
+- **`tact_export/` naming**: real listfile-resolved path when known (not
+  implemented yet, no `--listfile` flag exists), `FILE########.dat`
+  **directly under `tact_export/`** when not — revised 2026-08-16 (Luna):
+  originally specified as `_unresolved/FILE########.dat`, mirroring
+  `casc-tool`'s own `wow_export/` convention exactly; dropped the
+  `_unresolved/` nesting once real usage showed it added a layer with no
+  payoff while `--listfile` support doesn't exist to ever populate the
+  other half of that split. If `--listfile` support is added later,
+  revisit whether reintroducing a real/unresolved split is worth it once
+  both cases genuinely occur side by side — for now, everything is
+  unresolved, so a split has nothing to split.
 - **`tact_export/` stays a permanently separate tree** — no automatic or
   tool-driven merge into `wow_export/`. Different provenance/trust level
   (fetched live from Blizzard vs. extracted from a local install) stays

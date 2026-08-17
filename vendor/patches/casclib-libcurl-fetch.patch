@@ -1,6 +1,6 @@
 --- a/src/CascFiles.cpp
 +++ b/src/CascFiles.cpp
-@@ -17,6 +17,89 @@
+@@ -17,6 +17,90 @@
  #pragma comment(lib, "ws2_32.lib")          // Internet functions for HTTP stream
  #endif
  
@@ -12,6 +12,7 @@
 +// (CDN host/path selection, retry-across-hosts, local-cache-exists
 +// check, disk write) is untouched.
 +#include <curl/curl.h>
++#include <cstdio>
 +#include <cstring>
 +#include <ctime>
 +#include <string>
@@ -90,7 +91,7 @@
  //-----------------------------------------------------------------------------
  // Local defines
  
-@@ -1175,9 +1258,6 @@
+@@ -1175,9 +1259,6 @@
  
  static DWORD RibbitDownloadFile(LPCTSTR szCdnHostUrl, LPCTSTR szProduct, LPCTSTR szFileName, CASC_PATH<TCHAR> & LocalPath, CASC_BLOB & FileData)
  {
@@ -100,7 +101,7 @@
      TCHAR szRemoteUrl[256];
      DWORD dwErrCode = ERROR_CAN_NOT_COMPLETE;
  
-@@ -1200,41 +1280,56 @@
+@@ -1200,41 +1281,56 @@
      // Old (HTTP) download: wget http://us.patch.battle.net:1119/wow_classic/cdns
      CascStrPrintf(szRemoteUrl, _countof(szRemoteUrl), _T("%s/%s/%s"), szCdnHostUrl, szProduct, szFileName);
  
@@ -184,21 +185,42 @@
      return dwErrCode;
  }
  
-@@ -1245,59 +1340,21 @@
+@@ -1245,76 +1341,192 @@
      DWORD cbReadSize,
      DWORD dwPortFlags)
  {
 -    TFileStream * pRemStream;
 -    LPBYTE pbFileData;
 -    DWORD dwErrCode = ERROR_NOT_ENOUGH_MEMORY;
--
++    CASCLIB_UNUSED(cbReadSize);
++    CASCLIB_UNUSED(dwPortFlags);
++    CASCLIB_UNUSED(PtrByteOffset);
++    assert(PtrByteOffset == NULL);   // tact-fetch only ever does whole-file fetches (see FetchCascFile)
++
++    // szRemoteName is bare host+path with no scheme (BaseHttp_ParseURL's
++    // own convention, still used to build it in FetchCascFile above).
++    char szUrl[MAX_PATH + 16];
++    CascStrPrintf(szUrl, _countof(szUrl), "http://%s", szRemoteName);
++
++    std::string responseBody;
++    if(!TactFetchCurlGet(szUrl, responseBody))
++        return ERROR_CAN_NOT_COMPLETE;
++
++    return SaveLocalFile(szLocalName, (LPBYTE)responseBody.data(), responseBody.size());
++}
+ 
 -    // Open the remote stream
 -    pRemStream = FileStream_OpenFile(szRemoteName, BASE_PROVIDER_HTTP | STREAM_PROVIDER_FLAT | dwPortFlags);
 -    if(pRemStream != NULL)
--    {
++DWORD SetProductCodeName(TCascStorage * hs, LPCSTR szCodeName, size_t nLength)
++{
++    if(hs->szCodeName == NULL && szCodeName != NULL)
+     {
 -        // Will we download the entire file or just a part of it?
 -        if(PtrByteOffset == NULL)
--        {
++        // Make sure we have the length
++        if(nLength == 0)
+         {
 -            ULONGLONG FileSize = 0;
 -
 -            // Retrieve the file size, but not longer than 1 GB
@@ -219,42 +241,242 @@
 -            {
 -                dwErrCode = GetCascError();
 -            }
--        }
--
++            nLength = strlen(szCodeName);
+         }
+ 
 -        // Shall we read something?
 -        if((dwErrCode == ERROR_SUCCESS) && (cbReadSize != 0) && (pbFileData = CASC_ALLOC<BYTE>(cbReadSize)) != NULL)
 -        {
 -            // Read all required data from the remote file
 -            if(FileStream_Read(pRemStream, PtrByteOffset, pbFileData, cbReadSize))
 -                dwErrCode = SaveLocalFile(szLocalName, pbFileData, cbReadSize);
--
++        if((hs->szCodeName = CASC_ALLOC<TCHAR>(nLength + 1)) == NULL)
++            return ERROR_NOT_ENOUGH_MEMORY;
++        CascStrCopy(hs->szCodeName, nLength + 1, szCodeName, nLength);
++    }
++    return ERROR_SUCCESS;
++}
+ 
 -            // Free the data buffer
 -            CASC_FREE(pbFileData);
 -        }
--
++// tact-fetch local patch: a file living inside a packed CDN archive only
++// needs its own byte range, not the whole (observed up to 256 MB)
++// archive segment -- the archive-info FetchCascFile overload below
++// would otherwise substitute the archive's own key for the requested
++// file's key and fetch that whole blob, discarding everything but the
++// small span actually needed. This issues a real HTTP Range request for
++// exactly [offset, offset+length) instead, and verifies the response
++// really was partial (206, exact byte count) rather than silently
++// accepting a server that ignores Range and sends the whole body --
++// that would defeat the entire point of this patch.
++
++// One line per already-fetched range ("offset length\n") next to the
++// local archive-proxy file: the same archive can accumulate multiple
++// partial fetches over time (different files, different runs), and
++// FileAlreadyExists' whole-file-exists check doesn't mean what it used
++// to once the "file" is a sparse partial copy instead of a complete one.
++static bool TactFetchRangeAlreadyCached(LPCTSTR szLocalPath, DWORD dwOffset, DWORD dwLength)
++{
++    TCHAR szSidecar[MAX_PATH];
++    CascStrPrintf(szSidecar, _countof(szSidecar), _T("%s.ranges"), szLocalPath);
++
++    FILE * f = fopen(szSidecar, "r");
++    if(f == NULL)
++        return false;
+ 
 -        // Close the remote stream
 -        FileStream_Close(pRemStream);
--    }
++    unsigned long existingOffs = 0, existingLen = 0;
++    bool bFound = false;
++    while(fscanf(f, "%lu %lu\n", &existingOffs, &existingLen) == 2)
++    {
++        if(existingOffs <= dwOffset && (existingOffs + existingLen) >= ((unsigned long)dwOffset + dwLength))
++        {
++            bFound = true;
++            break;
++        }
+     }
 -    else
--    {
++    fclose(f);
++    return bFound;
++}
++
++static void TactFetchRecordRangeCached(LPCTSTR szLocalPath, DWORD dwOffset, DWORD dwLength)
++{
++    TCHAR szSidecar[MAX_PATH];
++    CascStrPrintf(szSidecar, _countof(szSidecar), _T("%s.ranges"), szLocalPath);
++
++    FILE * f = fopen(szSidecar, "a");
++    if(f != NULL)
+     {
 -        dwErrCode = GetCascError();
--    }
-+    CASCLIB_UNUSED(cbReadSize);
-+    CASCLIB_UNUSED(dwPortFlags);
-+    CASCLIB_UNUSED(PtrByteOffset);
-+    assert(PtrByteOffset == NULL);   // tact-fetch only ever does whole-file fetches (see FetchCascFile)
-+
-+    // szRemoteName is bare host+path with no scheme (BaseHttp_ParseURL's
-+    // own convention, still used to build it in FetchCascFile above).
-+    char szUrl[MAX_PATH + 16];
-+    CascStrPrintf(szUrl, _countof(szUrl), "http://%s", szRemoteName);
-+
-+    std::string responseBody;
-+    if(!TactFetchCurlGet(szUrl, responseBody))
-+        return ERROR_CAN_NOT_COMPLETE;
++        fprintf(f, "%lu %lu\n", (unsigned long)dwOffset, (unsigned long)dwLength);
++        fclose(f);
+     }
++}
  
 -    return dwErrCode;
-+    return SaveLocalFile(szLocalName, (LPBYTE)responseBody.data(), responseBody.size());
++static bool TactFetchCurlGetRange(const char * szUrl, DWORD dwOffset, DWORD dwLength, std::string & responseBody)
++{
++    char szRange[64];
++    CascStrPrintf(szRange, _countof(szRange), "%lu-%lu", (unsigned long)dwOffset,
++                  (unsigned long)(dwOffset + dwLength - 1));
++
++    CURL * curl = curl_easy_init();
++    if(curl == NULL)
++        return false;
++
++    curl_easy_setopt(curl, CURLOPT_URL, szUrl);
++    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
++    curl_easy_setopt(curl, CURLOPT_USERAGENT, TACT_FETCH_USER_AGENT);
++    curl_easy_setopt(curl, CURLOPT_TIMEOUT, TACT_FETCH_HTTP_TIMEOUT_SECONDS);
++    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
++    curl_easy_setopt(curl, CURLOPT_RANGE, szRange);
++    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, TactFetchCurlWrite);
++    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&responseBody);
++
++    CURLcode res = curl_easy_perform(curl);
++
++    long httpStatus = 0;
++    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpStatus);
++    g_tactFetchLastHttpStatus = httpStatus;
++
++    g_tactFetchLastRetryAfterSeconds = 0;
++#if LIBCURL_VERSION_NUM >= 0x073900   // CURLINFO_RETRY_AFTER added in curl 7.57.0
++    curl_off_t retryAfter = 0;
++    if(curl_easy_getinfo(curl, CURLINFO_RETRY_AFTER, &retryAfter) == CURLE_OK)
++        g_tactFetchLastRetryAfterSeconds = (long)retryAfter;
++#endif
++
++    curl_easy_cleanup(curl);
++
++    // 206 Partial Content is the only acceptable success. A server that
++    // ignores Range and answers 200 with the full body would silently
++    // reintroduce the exact whole-archive cost this patch exists to
++    // avoid -- treated as a hard failure, never as "good enough".
++    if(res != CURLE_OK || httpStatus != 206 || responseBody.size() != dwLength)
++        return false;
++    return true;
  }
  
- DWORD SetProductCodeName(TCascStorage * hs, LPCSTR szCodeName, size_t nLength)
+-DWORD SetProductCodeName(TCascStorage * hs, LPCSTR szCodeName, size_t nLength)
++static DWORD FetchRemoteArchiveRange(TCascStorage * hs, CASC_PATH<TCHAR> & LocalPath, LPBYTE pbArchiveKey,
++                                      DWORD dwOffset, DWORD dwLength)
+ {
+-    if(hs->szCodeName == NULL && szCodeName != NULL)
++    if(dwLength == 0)
++        return ERROR_SUCCESS;
++
++    if(TactFetchRangeAlreadyCached(LocalPath, dwOffset, dwLength))
++        return ERROR_SUCCESS;
++
++    if((hs->dwFeatures & CASC_FEATURE_ONLINE) == 0)
++        return ERROR_FILE_NOT_FOUND;
++
++    DWORD dwErrCode = ForcePathExist(LocalPath, true);
++    if(dwErrCode != ERROR_SUCCESS)
++        return dwErrCode;
++
++    LPCTSTR szCdnServers = hs->szCdnServers;
++    TCHAR szCdnServer[MAX_PATH] = _T("");
++    dwErrCode = ERROR_FILE_NOT_FOUND;
++
++    while((szCdnServers = ExtractCdnServerName(szCdnServer, _countof(szCdnServer), szCdnServers)) != NULL)
+     {
+-        // Make sure we have the length
+-        if(nLength == 0)
++        CASC_PATH<TCHAR> RemotePath(URL_SEP_CHAR);
++        RemotePath.Create(szCdnServer, hs->szCdnPath, GetSubFolder(PathTypeData), NULL);
++        RemotePath.AppendEKey(pbArchiveKey);
++
++        char szUrl[MAX_PATH + 16];
++        CascStrPrintf(szUrl, _countof(szUrl), "http://%s", (LPCTSTR)RemotePath);
++
++        std::string responseBody;
++        if(!TactFetchCurlGetRange(szUrl, dwOffset, dwLength, responseBody))
+         {
+-            nLength = strlen(szCodeName);
++            dwErrCode = ERROR_CAN_NOT_COMPLETE;
++            continue;
+         }
+ 
+-        if((hs->szCodeName = CASC_ALLOC<TCHAR>(nLength + 1)) == NULL)
+-            return ERROR_NOT_ENOUGH_MEMORY;
+-        CascStrCopy(hs->szCodeName, nLength + 1, szCodeName, nLength);
++        FILE * f = fopen(LocalPath, "r+b");
++        if(f == NULL)
++            f = fopen(LocalPath, "w+b");
++        if(f == NULL)
++        {
++            dwErrCode = ERROR_CAN_NOT_COMPLETE;
++            continue;
++        }
++
++        bool bWriteOk = (fseeko(f, (off_t)dwOffset, SEEK_SET) == 0) &&
++                        (fwrite(responseBody.data(), 1, responseBody.size(), f) == responseBody.size());
++        fclose(f);
++
++        if(bWriteOk)
++        {
++            TactFetchRecordRangeCached(LocalPath, dwOffset, dwLength);
++            return ERROR_SUCCESS;
++        }
++        dwErrCode = ERROR_CAN_NOT_COMPLETE;
+     }
+-    return ERROR_SUCCESS;
++    return dwErrCode;
+ }
+ 
+ DWORD FetchCascFile(
+@@ -1375,6 +1587,9 @@
+     PCASC_EKEY_ENTRY pEKeyEntry;
+     LPBYTE pbArchiveKey;
+     DWORD dwErrCode = ERROR_SUCCESS;
++    bool bIsArchiveMember = false;
++    DWORD dwArchiveOffs = 0;
++    DWORD dwArchiveLen = 0;
+ 
+     // Data files may be stored in archives, therefore we need to check
+     if((pbEKey != NULL) && (pEKeyEntry = (PCASC_EKEY_ENTRY)hs->IndexMap.FindObject(pbEKey)) != NULL)
+@@ -1393,6 +1608,10 @@
+ 
+             // Remap the path type to "data"
+             PathType = PathTypeData;
++
++            bIsArchiveMember = true;
++            dwArchiveOffs = pArchiveInfo->ArchiveOffs;
++            dwArchiveLen = pArchiveInfo->EncodedSize;
+         }
+         else
+         {
+@@ -1410,6 +1629,29 @@
+                 return ERROR_SUCCESS;
+         }
+ 
++        // tact-fetch local patch: an online storage with no local
++        // consolidated archives to fall back on (handle B, DESIGN.md #9)
++        // only needs this file's own byte range out of its containing
++        // archive, not the whole thing -- see FetchRemoteArchiveRange's
++        // comment. Deliberately does NOT fall through to the whole-file
++        // fetch branches below on failure: a Range request failing (a
++        // CDN host that doesn't honor Range, say) should surface as a
++        // real error for the caller's own retry loop to handle, never
++        // silently degrade into paying the exact cost this patch exists
++        // to avoid.
++        if(bIsArchiveMember && !(hs->dwFeatures & CASC_FEATURE_DATA_ARCHIVES))
++        {
++            LPCTSTR szRangeRootPath = (hs->szDataPath != NULL) ? hs->szDataPath : hs->szRootPath;
++            if(szRangeRootPath != NULL)
++            {
++                LocalPath.Create(szRangeRootPath, GetSubFolder(PathType), NULL);
++                LocalPath.AppendEKey(pbEKey);
++                LocalPath.AppendString(szExtension, false);
++
++                return FetchRemoteArchiveRange(hs, LocalPath, pbEKey, dwArchiveOffs, dwArchiveLen);
++            }
++        }
++
+         // Try to download the file into the "data/<type>" path
+         if(hs->szDataPath != NULL)
+         {
