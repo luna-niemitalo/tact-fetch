@@ -7,6 +7,39 @@ nothing here is actionable. Newest first.
 
 ---
 
+## 2026-08-19 — `--locale` flag added; encrypted-tail truncation fixed
+
+Two real bugs, both found by the `husk` session live-testing a real
+fetch of 3 real FileDataIDs (character customization name tables:
+`ChrCustomizationOption`/`Choice`/`Category.db2`), both fixed the same
+day. Full technical detail in `DESIGN.md` §9; summary here:
+
+1. **Silent tail truncation, fixed**: `FetchOneFile` (`src/fetch.cpp`)
+   now always opens with `CASC_OVERCOME_ENCRYPTED`, matching `casc-tool`'s
+   own prior fix for the identical symptom -- an unrecoverable
+   encrypted tail block used to silently shrink `ContentSize` instead of
+   erroring, with no way to tell "genuinely small" from "truncated" from
+   outside CascLib. Verified directly against the real 3 files: sizes
+   went from a silently-short 30893/329311/2803 bytes to the manifest's
+   real 31325/330518/2839, tail zero-filled and visible, not dropped.
+2. **`--locale <code>` added** (`src/locale.{h,cpp}`, new CLI flag in
+   `main.cpp`, default `all` -- existing behavior unchanged unless
+   passed): threads a real `CASC_LOCALE_*` mask through to `RunFetch`'s
+   handle B (the handle that actually fetches bytes), which previously
+   had no locale control at all -- it was hardcoded to `CASC_LOCALE_ALL`.
+   Root cause of "locale override does nothing" from an earlier same-day
+   investigation: CascLib's WoW root handler filters by locale
+   independently *per storage handle*, at root-parse time
+   (`CascRootFile_WoW.cpp:450`) -- handle A (local resolve,
+   `casc_storage.cpp`, deliberately still `CASC_LOCALE_ALL`: its job is
+   "known to the manifest at all," not locale selection) and handle B
+   are genuinely separate knobs, so an earlier fix attempt that only
+   touched handle A had zero effect on what got fetched. Verified
+   directly: `--locale enUS` against the same 3 FileDataIDs produced
+   different bytes than the (Korean-landing, for these particular IDs)
+   default, and the decoded strings are real English ("Skin Color",
+   "Hair Style", "Tattoo Style", ...).
+
 ## 2026-08-17 — Extension content-sniffing added; listfile resolution scoped to `casc-tool` for good
 
 `src/content_sniff.{h,cpp}` added: fetched files under `_unresolved/`

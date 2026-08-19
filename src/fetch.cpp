@@ -71,7 +71,15 @@ struct FetchOutcome {
 FetchOutcome FetchOneFile(HANDLE online_storage, const std::filesystem::path& export_root,
                            const ResolvedEntry& entry) {
   HANDLE file_handle = nullptr;
-  if (!CascOpenFile(online_storage, CASC_FILE_DATA_ID(entry.file_data_id), 0, CASC_OPEN_BY_FILEID, &file_handle)) {
+  // CASC_OVERCOME_ENCRYPTED: without it, a file whose *tail* falls in a
+  // block encrypted with a key we don't have gets silently short --
+  // CascGetFileSize64 reports a ContentSize smaller than the file's real
+  // logical size, no error raised, no way to tell "genuinely this small"
+  // from "truncated" from here. With it, that unrecoverable span gets
+  // zero-filled instead, matching casc-tool's own fix for the identical
+  // symptom (2026-08-16 CHANGELOG) -- see DESIGN.md #9.
+  if (!CascOpenFile(online_storage, CASC_FILE_DATA_ID(entry.file_data_id), 0,
+                     CASC_OPEN_BY_FILEID | CASC_OVERCOME_ENCRYPTED, &file_handle)) {
     return {FetchKind::kFailed, "CascOpenFile failed, CascLib error " + std::to_string(GetCascError())};
   }
 
@@ -130,7 +138,8 @@ int BackoffSeconds(int attempt) {
 }  // namespace
 
 bool RunFetch(const PlanSummary& plan, const std::filesystem::path& install_path,
-              const std::filesystem::path& state_dir, const std::filesystem::path& export_root) {
+              const std::filesystem::path& state_dir, const std::filesystem::path& export_root,
+              uint32_t locale_mask) {
   if (!HasFreshDryRunMarker(plan, state_dir)) {
     std::cerr << "RunFetch: expected a fresh dry-run marker (< " << politeness::kDryRunMarkerFreshnessMinutes
               << " minutes old) for this exact scope, actual: none found or stale -- run the dry-run step again "
@@ -164,7 +173,7 @@ bool RunFetch(const PlanSummary& plan, const std::filesystem::path& install_path
   // by this flag -- those are still only fetched once, on a genuine
   // cache miss, regardless.
   CASC_OPEN_STORAGE_ARGS open_args = {sizeof(CASC_OPEN_STORAGE_ARGS)};
-  open_args.dwLocaleMask = CASC_LOCALE_ALL;
+  open_args.dwLocaleMask = locale_mask;
   open_args.dwFlags = CASC_FEATURE_FORCE_DOWNLOAD;
 
   HANDLE online_storage = nullptr;

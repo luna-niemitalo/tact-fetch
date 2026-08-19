@@ -7,6 +7,7 @@
 #include "casc_storage.h"
 #include "dry_run.h"
 #include "fetch.h"
+#include "locale.h"
 #include "plan.h"
 #include "worklist.h"
 
@@ -16,19 +17,27 @@ struct CommonArgs {
   std::filesystem::path from_list;
   std::filesystem::path install_path;
   std::filesystem::path export_root = "tact_export";
+  std::string locale = "all";
 };
 
 void PrintUsage() {
-  std::cerr << "usage: tact-fetch <dry-run|fetch> --from-list <file> --install <path> [--export <dir>]\n"
-               "\n"
-               "  --from-list <file>  required. Plain text, one FileDataID per line\n"
-               "                      (casc-tool's own extract-batch --from-list convention).\n"
-               "                      There is no mode that scans the local install on its own\n"
-               "                      to decide what's missing -- see DESIGN.md #3/#7.\n"
-               "  --install <path>    required. Local WoW install directory containing\n"
-               "                      .build.info, opened strictly read-only.\n"
-               "  --export <dir>      optional, default 'tact_export'. Fetched files land\n"
-               "                      here (fetch only; unused by dry-run).\n";
+  std::cerr
+      << "usage: tact-fetch <dry-run|fetch> --from-list <file> --install <path> [--export <dir>] [--locale <code>]\n"
+         "\n"
+         "  --from-list <file>  required. Plain text, one FileDataID per line\n"
+         "                      (casc-tool's own extract-batch --from-list convention).\n"
+         "                      There is no mode that scans the local install on its own\n"
+         "                      to decide what's missing -- see DESIGN.md #3/#7.\n"
+         "  --install <path>    required. Local WoW install directory containing\n"
+         "                      .build.info, opened strictly read-only.\n"
+         "  --export <dir>      optional, default 'tact_export'. Fetched files land\n"
+         "                      here (fetch only; unused by dry-run).\n"
+         "  --locale <code>     optional, default 'all'. Which locale-variant CKey\n"
+         "                      handle B (the actual fetch, fetch only; unused by\n"
+         "                      dry-run) resolves each FileDataID to, e.g. 'enUS',\n"
+         "                      'koKR', 'deDE' -- see locale.h for the full list.\n"
+         "                      Local resolution (dry-run's already-local/missing\n"
+         "                      check) always uses 'all' regardless of this flag.\n";
 }
 
 // Returns nullopt (and has already printed an expected-vs-actual usage
@@ -44,8 +53,11 @@ std::optional<CommonArgs> ParseCommonArgs(int argc, char** argv) {
       args.install_path = argv[++i];
     } else if (flag == "--export" && i + 1 < argc) {
       args.export_root = argv[++i];
+    } else if (flag == "--locale" && i + 1 < argc) {
+      args.locale = argv[++i];
     } else {
-      std::cerr << "tact-fetch: expected one of --from-list/--install/--export, actual: '" << flag << "'\n";
+      std::cerr << "tact-fetch: expected one of --from-list/--install/--export/--locale, actual: '" << flag
+                << "'\n";
       return std::nullopt;
     }
   }
@@ -120,5 +132,12 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  return tactfetch::RunFetch(*plan, args->install_path, StateDir(), args->export_root) ? 0 : 1;
+  std::optional<uint32_t> locale_mask = tactfetch::ParseLocaleCode(args->locale);
+  if (!locale_mask) {
+    std::cerr << "tact-fetch: expected a known --locale code (e.g. 'all', 'enUS', 'koKR' -- see locale.h), actual: '"
+              << args->locale << "'\n";
+    return 1;
+  }
+
+  return tactfetch::RunFetch(*plan, args->install_path, StateDir(), args->export_root, *locale_mask) ? 0 : 1;
 }

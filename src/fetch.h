@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 
 #include "plan.h"
@@ -32,7 +33,17 @@ namespace tactfetch {
 // same path with `.encrypted` appended to the filename -- visible and
 // inspectable later, never silently dropped, and never mistaken for
 // real decoded content by an extension-matching consumer.
+//
+// `locale_mask` (a CascLib CASC_LOCALE_* value or bitwise-OR of several,
+// see locale.h) governs only handle B, the online storage this function
+// opens to actually fetch bytes -- NOT handle A (casc_storage.cpp's local
+// resolve, which stays CASC_LOCALE_ALL deliberately, see its own
+// comment). CascLib's WoW root handler applies locale filtering
+// independently per storage handle at root-parse time
+// (CascRootFile_WoW.cpp), so handle A's mask has zero effect on what
+// handle B resolves a FileDataID to -- they're genuinely separate knobs.
 bool RunFetch(const PlanSummary& plan, const std::filesystem::path& install_path,
-              const std::filesystem::path& state_dir, const std::filesystem::path& export_root);
+              const std::filesystem::path& state_dir, const std::filesystem::path& export_root,
+              uint32_t locale_mask);
 
 }  // namespace tactfetch

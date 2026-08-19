@@ -12,8 +12,11 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
 
 - **Current**: the full pipeline is implemented and builds clean
   (`direnv exec . cmake --build build`). `tact-fetch <dry-run|fetch>
-  --from-list <file> --install <path> [--export <dir>]` CLI
-  (`src/main.cpp`). Local-only handle A (`src/casc_storage.cpp`):
+  --from-list <file> --install <path> [--export <dir>] [--locale <code>]`
+  CLI (`src/main.cpp`; `--locale`, default `all`, added 2026-08-19 —
+  `src/locale.{h,cpp}` maps a code like `enUS`/`koKR` to a real
+  `CASC_LOCALE_*` mask, threaded through to handle B only — see below and
+  `DESIGN.md` §9). Local-only handle A (`src/casc_storage.cpp`):
   direct per-FileDataID resolution via `CascOpenFile`, no storage scan.
   Worklist loading/validation (`src/worklist.cpp`), bucketing
   (`src/plan.cpp`), dry-run report + freshness marker (`src/dry_run.cpp`),
@@ -33,7 +36,12 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
   against real extracted files, not `.dat` by default anymore when the
   format is recognized: `.m2`/`.blp`/`.skin`/`.db2`/`.ogg`/`.avi`)
   (`.encrypted`-postfixed if BLTE decode fails with
-  `ERROR_FILE_ENCRYPTED`). Vendored CascLib carries a **local patch**
+  `ERROR_FILE_ENCRYPTED`). `FetchOneFile`'s `CascOpenFile` always passes
+  `CASC_OVERCOME_ENCRYPTED` (added 2026-08-19, `DESIGN.md` §9): without
+  it, an unrecoverable *trailing* encrypted block silently shrinks
+  `ContentSize` instead of erroring — zero-filled and visible now,
+  matching `casc-tool`'s own prior fix for the identical symptom.
+  Vendored CascLib carries a **local patch**
   (not upstream): `HttpDownloadFile` and `RibbitDownloadFile`
   (`vendor/CascLib/src/CascFiles.cpp`) fetch via libcurl (HTTP/2, a real
   `User-Agent`, a real timeout) instead of CascLib's raw-socket client;
@@ -203,6 +211,30 @@ downloaded, straight from Blizzard's CDN, into a `tact_export/` tree.
      corrupted exact-match filtering (values compared equal to eye but
      not to `==`); regenerated clean, worth remembering for any future
      listfile-based analysis in this repo.
+  7. **Two real bugs, found by the `husk` session live-testing a real
+     fetch (2026-08-19), fixed same day** — full detail in `DESIGN.md`
+     §9's newest entry:
+     - **Silent tail truncation**: `FetchOneFile` wasn't passing
+       `CASC_OVERCOME_ENCRYPTED`, so an unrecoverable encrypted tail
+       block silently shrank `ContentSize` instead of erroring. Fixed
+       unconditionally; verified against the same 3 real FileDataIDs
+       husk reported on (30893/329311/2803 bytes without the fix, the
+       manifest's real 31325/330518/2839 with it).
+     - **No real `--locale` flag existed**, so an earlier same-session
+       attempt to force a locale override had zero effect on what
+       actually got fetched — traced to handle B's `dwLocaleMask` being
+       hardcoded `CASC_LOCALE_ALL` in `fetch.cpp`, and to
+       `CascRootFile_WoW.cpp` applying locale filtering independently
+       *per storage handle* at root-parse time, meaning handle A's mask
+       (local resolve) and handle B's (actual fetch) are genuinely
+       separate knobs — an override that only touches handle A does
+       nothing to what gets fetched. `--locale <code>` now threads a
+       real mask through to handle B specifically (`src/locale.{h,cpp}`,
+       default `all`, handle A stays `CASC_LOCALE_ALL` on purpose).
+       Verified directly: `--locale enUS` against the same 3 IDs
+       produced different bytes than the default, decoding to real
+       English strings ("Skin Color", "Hair Style", ...) instead of
+       Korean.
 - **Next step**: no open findings right now, and the biggest open
   question (who does path resolution) is now closed. Natural next
   pieces if picked back up: build the `casc-tool` side of path

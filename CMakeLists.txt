@@ -43,6 +43,7 @@ add_executable(tact-fetch
   src/content_sniff.cpp
   src/dry_run.cpp
   src/fetch.cpp
+  src/locale.cpp
   src/log.cpp
   src/plan.cpp
   src/worklist.cpp

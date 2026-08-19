@@ -646,3 +646,40 @@ reader/agent never has to re-derive them:
   visible for as long as both trees exist; if a human ever wants to
   collapse them, that's a manual, deliberate action outside this tool's
   scope, not a feature to build.
+- **Two real bugs found and fixed (2026-08-19), reported by the `husk`
+  session live-testing a real fetch of 3 real FileDataIDs
+  (`ChrCustomizationOption`/`Choice`/`Category.db2`)**:
+  1. **Silent tail truncation.** `FetchOneFile` (`src/fetch.cpp`) opened
+     handle B's files without `CASC_OVERCOME_ENCRYPTED`. A file whose
+     *tail* falls in a block encrypted with a key we don't have then
+     gets a `ContentSize` from `CascGetFileSize64` that's silently
+     smaller than the file's real logical size -- no error, no way to
+     tell "genuinely this small" from "truncated" from outside CascLib.
+     Same symptom `casc-tool` already hit and fixed (its 2026-08-16
+     CHANGELOG). Fixed by always passing `CASC_OVERCOME_ENCRYPTED` on
+     `CascOpenFile`, which zero-fills that unrecoverable span instead --
+     verified directly: without the flag, the 3 files landed at
+     30893/329311/2803 bytes; with it, at the manifest's real
+     31325/330518/2839, tail zero-filled, matching the general shape of
+     the encrypted-tail marker this tool already uses elsewhere (never
+     silently dropped, always visible in the output).
+  2. **`--locale` had no effect on what actually gets fetched, because
+     it never existed as a flag at all** -- `RunFetch` hardcoded handle
+     B's `dwLocaleMask` to `CASC_LOCALE_ALL`. Root cause, confirmed
+     against `CascRootFile_WoW.cpp:450`: CascLib's WoW root handler
+     applies locale filtering **independently per storage handle, at
+     root-parse time** (`Load()` → `LoadWowRootFileLocales`) -- handle
+     A's locale mask (`casc_storage.cpp`, local resolve) and handle B's
+     (`fetch.cpp`, the actual byte fetch) are genuinely separate knobs,
+     not one shared setting. `--locale <code>` (`src/locale.{h,cpp}`,
+     `main.cpp`) now threads a real `CASC_LOCALE_*` mask through to
+     handle B only; handle A stays `CASC_LOCALE_ALL` deliberately (its
+     job is "known to the manifest at all," not locale selection --
+     see its own comment). Verified directly: the same 3 FileDataIDs,
+     fetched with `--locale enUS`, produced different bytes than the
+     default (`31194`/`315836`/`2590` vs. `31325`/`330518`/`2839`), and
+     `strings` on the enUS output shows real English text ("Skin
+     Color", "Hair Style", "Tattoo Style", ...) instead of the Korean
+     text a `--locale koKR`-equivalent (or the unfixed default, which
+     happened to land on the Korean-flagged root block for these 3
+     IDs) produces.
